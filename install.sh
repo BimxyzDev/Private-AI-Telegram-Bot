@@ -458,7 +458,14 @@ run_update_flow() {
   if [[ -d "${APP_DIR}/.git" ]]; then
     log_info "Menjalankan git pull di ${APP_DIR}..."
     git config --global --add safe.directory "${APP_DIR}" || true
-    git -C "${APP_DIR}" fetch --all
+    # Pastikan remote 'origin' (source code bot) selalu ada & benar, terlepas dari
+    # remote 'db-backup' yang mungkin sudah ditambahkan oleh github_auto_setup sebelumnya.
+    if git -C "${APP_DIR}" remote get-url origin &>/dev/null; then
+      git -C "${APP_DIR}" remote set-url origin "${REPO_GIT_URL}"
+    else
+      git -C "${APP_DIR}" remote add origin "${REPO_GIT_URL}"
+    fi
+    git -C "${APP_DIR}" fetch origin
     git -C "${APP_DIR}" reset --hard "origin/${REPO_BRANCH}"
     log_success "Code berhasil diperbarui via git pull."
   else
@@ -524,7 +531,12 @@ run_fresh_install_flow() {
   if [[ -d "${APP_DIR}/.git" ]]; then
     log_warn "Repo git sudah ada di ${APP_DIR}, menjalankan git pull alih-alih clone ulang..."
     git config --global --add safe.directory "${APP_DIR}" || true
-    git -C "${APP_DIR}" fetch --all
+    if git -C "${APP_DIR}" remote get-url origin &>/dev/null; then
+      git -C "${APP_DIR}" remote set-url origin "${REPO_GIT_URL}"
+    else
+      git -C "${APP_DIR}" remote add origin "${REPO_GIT_URL}"
+    fi
+    git -C "${APP_DIR}" fetch origin
     git -C "${APP_DIR}" reset --hard "origin/${REPO_BRANCH}"
   else
     log_info "Meng-clone repository dari ${REPO_GIT_URL}..."
