@@ -95,6 +95,73 @@ MODEL_TIER_SHORT_LABELS = {
     "heavy": "🔴 Heavy",
 }
 
+GPU_DISABLED_IMAGE_MESSAGE = (
+    "⚠️ Maaf, server saat ini berjalan tanpa GPU (CPU-Only). Fitur analisis gambar "
+    "dinonaktifkan demi menjaga stabilitas server."
+)
+
+
+# =========================================================================
+# DETEKSI GPU OTOMATIS (SAAT STARTUP)
+# =========================================================================
+
+def detect_gpu() -> bool:
+    """
+    Mendeteksi apakah server punya GPU yang bisa dipakai, dicek lewat 2 cara
+    (mana saja yang berhasil duluan dianggap cukup):
+      1. Command `nvidia-smi` tersedia & bisa dijalankan (GPU NVIDIA terpasang + driver aktif).
+      2. `torch.cuda.is_available()` True (jika library torch terinstall).
+    Dipanggil sekali saat startup dan hasilnya disimpan ke variabel global HAS_GPU,
+    dipakai sebagai guardrail sebelum bot mengirim request analisis gambar ke Ollama.
+    """
+    # Cara 1: cek command nvidia-smi
+    try:
+        result = subprocess_run_nvidia_smi()
+        if result:
+            logger.info("Deteksi GPU: nvidia-smi tersedia dan berhasil dijalankan. GPU terdeteksi.")
+            return True
+    except Exception as e:
+        logger.debug("Deteksi GPU via nvidia-smi gagal/tidak tersedia: %s", e)
+
+    # Cara 2: cek torch.cuda.is_available() (opsional, hanya jika torch terinstall)
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available():
+            logger.info("Deteksi GPU: torch.cuda.is_available() = True. GPU terdeteksi.")
+            return True
+    except ImportError:
+        logger.debug("Library torch tidak terinstall, melewati pengecekan torch.cuda.is_available().")
+    except Exception as e:
+        logger.debug("Deteksi GPU via torch gagal: %s", e)
+
+    logger.warning(
+        "Tidak ada GPU terdeteksi (nvidia-smi maupun torch.cuda tidak tersedia/aktif). "
+        "Bot akan berjalan mode CPU-Only, fitur analisis gambar akan dinonaktifkan."
+    )
+    return False
+
+
+def subprocess_run_nvidia_smi() -> bool:
+    """Menjalankan `nvidia-smi` dan mengembalikan True jika command ada dan exit code 0."""
+    import subprocess
+    import shutil as _shutil
+
+    if _shutil.which("nvidia-smi") is None:
+        return False
+
+    proc = subprocess.run(
+        ["nvidia-smi"],
+        capture_output=True,
+        timeout=10,
+    )
+    return proc.returncode == 0
+
+
+# Dideteksi sekali saat modul di-load (startup bot). Dipakai sebagai guardrail
+# di handle_photo agar server CPU-only tidak dipaksa memproses request gambar
+# yang berat dan bisa mengganggu stabilitas (lihat GPU_DISABLED_IMAGE_MESSAGE).
+HAS_GPU: bool = detect_gpu()
+
 
 # =========================================================================
 # HELPER
@@ -649,6 +716,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Guardrail GPU: analisis gambar (vision) cukup berat untuk CPU-only server.
+    # Jika server tidak punya GPU, tolak request di sini sebelum sempat mengunduh
+    # file atau memanggil Ollama sama sekali, demi menjaga stabilitas server.
+    if not HAS_GPU:
+        await update.effective_message.reply_text(GPU_DISABLED_IMAGE_MESSAGE)
+        return
+
     # Telegram mengirim beberapa resolusi; ambil yang terbesar (kualitas terbaik)
     photo = update.effective_message.photo[-1]
     filename = f"photo_{photo.file_unique_id}.jpg"
@@ -705,6 +779,14 @@ def main() -> None:
         logger.warning(
             "ffmpeg/ffprobe tidak ditemukan di PATH. Analisis video tidak akan berfungsi "
             "sampai ffmpeg diinstall (sudo apt-get install ffmpeg)."
+        )
+
+    if HAS_GPU:
+        logger.info("GPU terdeteksi. Fitur analisis gambar (vision) AKTIF.")
+    else:
+        logger.warning(
+            "GPU TIDAK terdeteksi (mode CPU-Only). Fitur analisis gambar (vision) DINONAKTIFKAN "
+            "untuk user demi menjaga stabilitas server."
         )
 
     # concurrent_updates diaktifkan agar panggilan Ollama yang lama (s/d 10 menit) untuk

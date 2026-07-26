@@ -20,6 +20,11 @@ Stabilitas & Timeout:
     processing tidak melambat akibat context window default yang terlalu besar.
   - Semua error (termasuk timeout) ditangani sebagai AIEngineError dengan
     pesan ramah-user, tidak pernah membuat proses Python crash.
+
+Personalitas:
+  - Setiap request chat ke Ollama otomatis menyertakan system prompt
+    (DEFAULT_SYSTEM_PROMPT) yang membuat bot bergaya santai/gaul dan anti
+    baper, bisa dikustomisasi lewat env var BOT_SYSTEM_PROMPT.
 """
 
 import os
@@ -89,6 +94,21 @@ MAX_EXTRACTED_CHARS = 200_000
 VIDEO_SAMPLE_FRAMES = 4
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
+
+# =========================================================================
+# PERSONALITAS / SYSTEM PROMPT (ANTI BAPER)
+# =========================================================================
+# Disuntikkan sebagai pesan role "system" pertama di setiap request chat ke
+# Ollama, supaya bot punya kepribadian konsisten: santai, gaul, tidak baperan,
+# dan tidak membalas dengan gaya customer service formal ala Bahasa Inggris.
+DEFAULT_SYSTEM_PROMPT = os.environ.get(
+    "BOT_SYSTEM_PROMPT",
+    "Kamu adalah BIMXYZ AI BOT, asisten AI dan koding yang cerdas, santai, gaul, dan "
+    "responsif. Selalu gunakan Bahasa Indonesia yang natural, santai, dan komunikatif. "
+    "Jika user bercanda, menggunakan bahasa gaul, atau mengumpat (seperti 'asu', 'anjing', "
+    "dll), tanggapi dengan santai, lucu, atau humoris. Dilarang keras meminta maaf secara "
+    "formal dalam Bahasa Inggris ala Customer Service.",
+)
 
 
 def resolve_model(tier: Optional[str]) -> str:
@@ -441,8 +461,12 @@ def process_uploaded_file(filename: str, content: bytes) -> Dict[str, object]:
 # =========================================================================
 
 def build_prompt_context(history: List[dict], new_message: str) -> List[dict]:
-    """Membangun list pesan format chat (role/content) untuk dikirim ke Ollama."""
-    messages = []
+    """
+    Membangun list pesan format chat (role/content) untuk dikirim ke Ollama.
+    Pesan "system" berisi personality prompt (anti baper) selalu disisipkan
+    sebagai pesan pertama, sebelum riwayat chat.
+    """
+    messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
     for item in history:
         role = item["role"]
         if role not in ("user", "assistant", "system"):
