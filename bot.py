@@ -334,7 +334,15 @@ def _git_push_db_sync() -> None:
         logger.warning("GH backup: %s bukan git repo, skip push.", _APP_DIR)
         return
 
-    _run_git(["add", _DB_BASENAME], cwd=_APP_DIR)
+    if not os.path.isfile(DB_PATH):
+        logger.warning("GH backup: %s tidak ditemukan, skip push.", DB_PATH)
+        return
+
+    add_result = _run_git(["add", _DB_BASENAME], cwd=_APP_DIR)
+    if add_result.returncode != 0:
+        logger.warning("GH backup: git add gagal: %s", add_result.stderr.strip())
+        return
+
     commit_msg = f"Auto-backup DB: {_time.strftime('%Y-%m-%d %H:%M:%S')}"
     commit_result = _run_git(["commit", "-m", commit_msg], cwd=_APP_DIR)
     if commit_result.returncode != 0 and "nothing to commit" not in commit_result.stdout.lower():
@@ -344,8 +352,9 @@ def _git_push_db_sync() -> None:
     for branch in ("main", "master"):
         push_result = _run_git(["push", "db-backup", f"HEAD:{branch}"], cwd=_APP_DIR)
         if push_result.returncode == 0:
-            logger.info("GH backup: database.db berhasil di-push ke branch %s.", branch)
+            logger.info("GH backup: %s berhasil di-push ke branch %s.", _DB_BASENAME, branch)
             return
+        logger.warning("GH backup: push ke %s gagal: %s", branch, push_result.stderr.strip())
     logger.warning("GH backup: git push gagal ke main maupun master.")
 
 
@@ -353,17 +362,14 @@ async def github_auto_backup_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Loop background: cek hash database.db tiap 60 detik, push ke GitHub hanya jika berubah."""
     last_hash: Optional[str] = None
     while True:
-        await asyncio.sleep(GH_BACKUP_INTERVAL_SEC)
         try:
             current_hash = _file_hash(DB_PATH)
-            if current_hash is None:
-                continue
-            if current_hash == last_hash:
-                continue  # tidak ada perubahan, skip push demi hemat CPU/bandwidth
-            await asyncio.to_thread(_git_push_db_sync)
-            last_hash = current_hash
+            if current_hash is not None and current_hash != last_hash:
+                await asyncio.to_thread(_git_push_db_sync)
+                last_hash = current_hash
         except Exception:
             logger.exception("GH backup: error tak terduga di loop auto-backup")
+        await asyncio.sleep(GH_BACKUP_INTERVAL_SEC)
 
 
 async def _post_init_start_backup(application: Application) -> None:
