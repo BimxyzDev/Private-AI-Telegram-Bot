@@ -47,7 +47,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import TelegramError
+from telegram.constants import ParseMode
+from telegram.error import TelegramError, BadRequest
 
 import database as db
 import ai_engine as engine
@@ -194,13 +195,26 @@ def format_number_id(n: int) -> str:
     return f"{n:,}".replace(",", ".")
 
 
+async def _reply_text_safe(update: Update, text: str):
+    """
+    Kirim pesan dengan parse_mode Markdown agar code block/format AI tampil rapi di
+    Telegram. Jika Markdown dari AI malformed (BadRequest), fallback kirim ulang
+    sebagai plain text agar pesan tetap terkirim dan bot tidak crash.
+    """
+    try:
+        return await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except BadRequest as e:
+        logger.warning("Markdown parse gagal (%s), fallback ke plain text.", e)
+        return await update.effective_message.reply_text(text)
+
+
 async def send_long_message(update: Update, text: str) -> None:
     """Telegram membatasi 4096 karakter per pesan; pesan panjang dipecah otomatis."""
     if not text:
         text = "[Jawaban kosong]"
     for i in range(0, len(text), MAX_TELEGRAM_MSG_LEN):
         chunk = text[i : i + MAX_TELEGRAM_MSG_LEN]
-        await update.effective_message.reply_text(chunk)
+        await _reply_text_safe(update, chunk)
 
 
 AUTO_FILE_THRESHOLD = 3000
@@ -256,7 +270,7 @@ async def deliver_ai_reply(update: Update, reply_text: str) -> None:
     else:
         for i in range(0, len(clean_text), MAX_TELEGRAM_MSG_LEN):
             chunk = clean_text[i : i + MAX_TELEGRAM_MSG_LEN]
-            sent_message = await update.effective_message.reply_text(chunk)
+            sent_message = await _reply_text_safe(update, chunk)
 
     if should_pin:
         try:

@@ -32,7 +32,6 @@ SERVICE_USER="aibot"
 ENV_FILE="${APP_DIR}/.env"
 
 # --- GitHub Backup & Restore (otomatis, hanya butuh PAT) ---
-GH_BACKUP_REPO_NAME="ai-bot-db-backup"
 DB_FILE_NAME="bot_data.db"
 
 # --- Sistem 3 Tier Model ---
@@ -187,14 +186,15 @@ print('Migrasi database selesai (kuota token per-user, model_tier, redeem token_
 }
 
 github_auto_setup() {
-  # Input hanya PAT. Username & repo di-auto-detect/auto-create via GitHub API.
+  # Input hanya PAT. Username & repo di-auto-detect via GitHub API (TIDAK membuat repo baru,
+  # supaya kompatibel dengan Fine-grained PAT yang dikunci ke 1 repo spesifik).
   echo -e "${BOLD}=================================================================${NC}"
   echo -e "${BOLD}   GITHUB BACKUP & RESTORE DATABASE (OTOMATIS)${NC}"
   echo -e "${BOLD}=================================================================${NC}"
   echo ""
   echo -e "${YELLOW}⚠️ MASUKKAN GITHUB PERSONAL ACCESS TOKEN (PAT) ⚠️${NC}"
-  echo -e "Rekomendasi: Gunakan Fine-grained PAT dengan akses"
-  echo -e "\"Repository permissions\" -> \"Contents\" -> \"Read and write\"."
+  echo -e "Rekomendasi: Gunakan Fine-grained PAT yang di-scope ke 1 repo backup"
+  echo -e "khusus, dengan akses \"Repository permissions\" -> \"Contents\" -> \"Read and write\"."
   echo -e "--------------------------------------------------"
   read -r -p "GitHub PAT (kosongkan untuk skip fitur backup): " GH_PAT_INPUT < "${TTY_IN}"
   echo ""
@@ -214,27 +214,28 @@ github_auto_setup() {
   fi
   log_success "Terautentikasi sebagai GitHub user: ${GH_USERNAME}"
 
-  log_info "Mengecek apakah repo ${GH_USERNAME}/${GH_BACKUP_REPO_NAME} sudah ada..."
-  REPO_CHECK_STATUS="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${GH_PAT_INPUT}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GH_USERNAME}/${GH_BACKUP_REPO_NAME}")"
+  log_info "Mendeteksi repo yang diizinkan oleh PAT ini..."
+  REPOS_RESPONSE="$(curl -s -w '\n%{http_code}' -H "Authorization: Bearer ${GH_PAT_INPUT}" -H "Accept: application/vnd.github+json" "https://api.github.com/user/repos?per_page=100&sort=updated")"
+  REPOS_STATUS="$(echo "${REPOS_RESPONSE}" | tail -n1)"
+  REPOS_BODY="$(echo "${REPOS_RESPONSE}" | sed '$d')"
 
-  if [[ "${REPO_CHECK_STATUS}" == "200" ]]; then
-    log_success "Repo backup sudah ada, akan dipakai ulang."
-  else
-    log_info "Repo belum ada, membuat repo private '${GH_BACKUP_REPO_NAME}' otomatis..."
-    CREATE_STATUS="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-      -H "Authorization: Bearer ${GH_PAT_INPUT}" -H "Accept: application/vnd.github+json" \
-      https://api.github.com/user/repos \
-      -d "{\"name\":\"${GH_BACKUP_REPO_NAME}\",\"private\":true,\"auto_init\":true}")"
-    if [[ "${CREATE_STATUS}" == "201" ]]; then
-      log_success "Repo private ${GH_BACKUP_REPO_NAME} berhasil dibuat."
-      sleep 2
-    else
-      log_error "Gagal membuat repo (HTTP ${CREATE_STATUS}). Fitur backup/restore dilewati."
-      return 0
-    fi
+  if [[ "${REPOS_STATUS}" != "200" ]]; then
+    log_error "Gagal mengambil daftar repo (HTTP ${REPOS_STATUS}). Fitur backup/restore dilewati."
+    return 0
   fi
 
-  GH_REMOTE_URL="https://${GH_PAT_INPUT}@github.com/${GH_USERNAME}/${GH_BACKUP_REPO_NAME}.git"
+  # Ambil nama repo pertama dari respons JSON (field "name" milik object repo, bukan owner/dsb).
+  GH_DETECTED_REPO="$(echo "${REPOS_BODY}" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
+
+  if [[ -z "${GH_DETECTED_REPO}" ]]; then
+    log_error "PAT ini tidak punya akses ke repo manapun (daftar repo kosong)."
+    log_error "Pastikan Fine-grained PAT di-scope ke minimal 1 repo dengan permission Contents: Read and write."
+    log_error "Fitur backup/restore dilewati."
+    return 0
+  fi
+  log_success "Repo terdeteksi: ${GH_USERNAME}/${GH_DETECTED_REPO} (akan dipakai sebagai remote backup)."
+
+  GH_REMOTE_URL="https://${GH_PAT_INPUT}@github.com/${GH_USERNAME}/${GH_DETECTED_REPO}.git"
 
   log_info "Menyiapkan git remote 'db-backup' di ${APP_DIR}..."
   git config --global --add safe.directory "${APP_DIR}" || true
@@ -247,7 +248,7 @@ github_auto_setup() {
     git -C "${APP_DIR}" remote add db-backup "${GH_REMOTE_URL}"
   fi
 
-  log_info "Mengecek apakah ada database.db lama di remote backup untuk di-restore..."
+  log_info "Mengecek apakah ada ${DB_FILE_NAME} lama di remote backup untuk di-restore..."
   TMP_RESTORE="$(mktemp -d)"
   if git clone -q --depth 1 "${GH_REMOTE_URL}" "${TMP_RESTORE}" 2>/dev/null; then
     if [[ -f "${TMP_RESTORE}/${DB_FILE_NAME}" ]]; then
@@ -271,7 +272,7 @@ github_auto_setup() {
     {
       echo "GH_BACKUP_ENABLED=true"
       echo "GH_BACKUP_PAT=${GH_PAT_INPUT}"
-      echo "GH_BACKUP_REPO=${GH_USERNAME}/${GH_BACKUP_REPO_NAME}"
+      echo "GH_BACKUP_REPO=${GH_USERNAME}/${GH_DETECTED_REPO}"
     } >> "${ENV_FILE}"
     chmod 600 "${ENV_FILE}"
   fi
@@ -395,7 +396,7 @@ print_footer() {
     GH_REPO_DISPLAY="$(grep '^GH_BACKUP_REPO=' "${ENV_FILE}" | cut -d= -f2)"
     echo -e "${BLUE}${BOLD}   BACKUP OTOMATIS DATABASE KE GITHUB${NC}"
     echo -e "   Status   : ${GREEN}AKTIF${NC} (auto-push tiap 60 detik jika ada perubahan)"
-    echo -e "   Repo     : ${GREEN}https://github.com/${GH_REPO_DISPLAY}${NC} (private)"
+    echo -e "   Repo     : ${GREEN}https://github.com/${GH_REPO_DISPLAY}${NC}"
     echo ""
   fi
   echo -e "${BLUE}${BOLD}8. CARA UPDATE DI MASA DEPAN${NC}"
@@ -555,7 +556,7 @@ TELEGRAM_BOT_TOKEN=${BOT_TOKEN_INPUT}
 OWNER_TELEGRAM_ID=${OWNER_ID_INPUT}
 GH_BACKUP_ENABLED=${GH_BACKUP_ENABLED:-false}
 GH_BACKUP_PAT=${GH_PAT_INPUT:-}
-GH_BACKUP_REPO=${GH_USERNAME:-}/${GH_BACKUP_REPO_NAME}
+GH_BACKUP_REPO=${GH_USERNAME:-}/${GH_DETECTED_REPO:-}
 EOF
   chmod 600 "${ENV_FILE}"
   log_success "Konfigurasi bot berhasil disimpan secara aman (chmod 600, tidak ada di source code)."
