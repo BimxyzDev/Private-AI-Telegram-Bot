@@ -1,25 +1,28 @@
 # Private AI Telegram Bot
 
-Bot Telegram AI privat (mode polling): chat/coding (qwen2.5-coder:14b) + analisis
-gambar & video (qwen2.5vl). Setiap user mendapat limit chat harian, dengan sistem
-kode redeem untuk menaikkan limit (termasuk unlimited) hingga masa berlaku tertentu.
+Bot Telegram AI privat (mode polling): chat/coding lewat 3 tier model
+(qwen2.5-coder 1.5b/7b/14b) + analisis gambar & video (qwen2.5vl). Setiap user
+mendapat kuota token harian, dengan sistem kode redeem untuk menaikkan kuota
+(termasuk unlimited) hingga masa berlaku tertentu.
 
 ## Isi Paket
-- `bot.py`         — Bot Telegram utama (polling, python-telegram-bot)
-- `ai_engine.py`   — Logika inti: ekstraksi file, panggilan ke Ollama (chat & vision)
-- `database.py`    — Layer SQLite: riwayat chat, data user, limit, kode redeem
-- `install.sh`     — Installer otomatis (curl | sudo bash)
+- `bot.py`            — Bot Telegram utama (polling, python-telegram-bot)
+- `ai_engine.py`      — Logika inti: ekstraksi file, panggilan ke Ollama (chat & vision)
+- `database.py`       — Layer SQLite: riwayat chat, data user, limit, kode redeem
+- `github_backup.py`  — Backup & restore database ke GitHub lewat REST API (lihat bagian di bawah)
+- `install.sh`        — Installer otomatis (curl | sudo bash)
 
 ## Cara Deploy
-1. Upload keempat file di atas ke repo GitHub Anda.
-2. Edit `install.sh`, ganti `REPO_RAW_BASE` dengan URL raw repo Anda.
+1. Upload kelima file di atas ke repo GitHub Anda (ini repo *source code*, terpisah
+   dari repo backup database di bagian "Backup Database ke GitHub" di bawah).
+2. Edit `install.sh`, ganti `REPO_GIT_URL` di bagian atas file dengan URL repo Anda.
 3. Siapkan dua hal dari Telegram sebelum instalasi:
    - **Token Bot** dari [@BotFather](https://t.me/BotFather) (perintah `/newbot`)
    - **ID Telegram Owner** dari [@userinfobot](https://t.me/userinfobot) (kirim pesan apa
      saja, ID kamu akan ditampilkan)
 4. Di VPS Ubuntu, jalankan:
    ```
-   curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/install.sh | sudo bash
+   curl -sL https://raw.githubusercontent.com/<user>/<repo>/main/install.sh | sudo bash
    ```
 5. Installer akan meminta Token Bot dan ID Owner di tengah proses instalasi, lalu
    otomatis menyimpannya ke `/opt/ai-bot/.env` (chmod 600) — TIDAK ADA di source code.
@@ -28,21 +31,28 @@ kode redeem untuk menaikkan limit (termasuk unlimited) hingga masa berlaku terte
 Bot berjalan mode **polling**, jadi tidak butuh domain, SSL/certbot, maupun Nginx —
 cukup koneksi internet keluar dari VPS ke server Telegram.
 
-## Limit Chat & Kode Redeem
+## Kuota Token & Kode Redeem
 
-- Setiap user baru otomatis mendapat **20 chat/hari**, reset otomatis setiap hari.
+- Setiap user baru otomatis mendapat **50.000 token/hari** (reset otomatis tiap
+  ganti hari UTC). Token terpakai dihitung dari jumlah token asli Ollama
+  (prompt + hasil jawaban) dikali multiplier tier model yang dipakai.
+- User memilih tier model AI lewat `/model`:
+  - 🟢 **Light** (`qwen2.5-coder:1.5b`) — kuota token x1, paling irit
+  - 🟡 **Medium** (`qwen2.5-coder:7b`) — kuota token x2, default
+  - 🔴 **Heavy** (`qwen2.5-coder:14b`) — kuota token x3, reasoning maksimal
 - Owner bisa membuat kode redeem lewat command di Telegram:
   ```
-  /gencode <limit> <hari>        contoh: /gencode 50 30
-  /gencode unlimited <hari>      contoh: /gencode unlimited 365
+  /gencode <jumlah_token> <hari>   contoh: /gencode 100000 30
+  /gencode unlimited <hari>        contoh: /gencode unlimited 365
   ```
 - User menukar kode dengan:
   ```
   /redeem <kode>
   ```
 - Setiap kode hanya bisa dipakai **satu kali** oleh satu user.
-- Setelah masa berlaku (hari) habis, limit user otomatis kembali ke default 20/hari —
-  ini dicek otomatis setiap kali user mengirim pesan, tidak perlu campur tangan owner.
+- Setelah masa berlaku (hari) habis, kuota user otomatis kembali ke default
+  50.000 token/hari — ini dicek otomatis setiap kali user mengirim pesan,
+  tidak perlu campur tangan owner.
 
 ## Perintah Bot
 
@@ -50,16 +60,17 @@ cukup koneksi internet keluar dari VPS ke server Telegram.
 | Command | Fungsi |
 |---|---|
 | `/start`, `/help` | Info & daftar perintah |
-| `/status` | Lihat sisa limit chat hari ini / status plan |
-| `/redeem <kode>` | Tukar kode redeem untuk menaikkan limit |
+| `/status` | Lihat sisa kuota token hari ini & tier model aktif |
+| `/model` | Pilih tier model AI (Light/Medium/Heavy) |
+| `/redeem <kode>` | Tukar kode redeem untuk menaikkan kuota token |
 | `/reset` | Hapus riwayat chat (mulai percakapan baru) |
 
 **Khusus Owner** (berdasarkan `OWNER_TELEGRAM_ID`):
 | Command | Fungsi |
 |---|---|
-| `/gencode <limit\|unlimited> <hari>` | Buat kode redeem baru |
+| `/gencode <jumlah_token\|unlimited> <hari>` | Buat kode redeem baru |
 | `/codes` | Lihat kode redeem yang belum dipakai |
-| `/users` | Lihat daftar user & status limit mereka |
+| `/users` | Lihat daftar user & status kuota mereka |
 | `/ban <id>` | Nonaktifkan akses user |
 | `/unban <id>` | Aktifkan kembali akses user |
 | `/broadcast <pesan>` | Kirim pesan ke semua user terdaftar |
@@ -78,7 +89,28 @@ Kirim file langsung ke bot (sebagai dokumen, foto, atau video Telegram):
 | ZIP             | .zip                                        | Diekstrak, tiap file di dalam diproses otomatis sesuai jenisnya (maks 20 file, maks 200MB hasil ekstrak) |
 
 Batas upload per file: **50 MB**. Setiap file yang diproses tetap dihitung sebagai
-satu penggunaan limit chat harian.
+pemakaian kuota token harian (sesuai jumlah token hasil pemrosesan x multiplier tier model).
+
+## Backup Database ke GitHub (Opsional)
+
+Database (`bot_data.db`) bisa di-backup otomatis ke repo GitHub terpisah, supaya
+riwayat chat & user tetap aman walau server hilang/di-reset.
+
+- Cara kerja: tiap 60 detik bot mengecek apakah database berubah, lalu meng-gzip
+  dan meng-upload-nya lewat **GitHub REST API** (`github_backup.py`) — **bukan**
+  lewat perintah `git`. Ini sengaja dipisah total dari repo source code bot,
+  supaya proses update kode (`git pull`) tidak akan pernah menyentuh atau
+  menghapus database.
+- Setup: saat instalasi (atau lewat menu Update), masukkan **GitHub PAT** (fine-grained,
+  di-scope ke satu repo backup, izin *Contents: Read and write*) dan **repo tujuan**
+  (`owner/repo`, harus repo terpisah dari repo source code bot ini).
+- Saat instalasi, kalau repo backup sudah punya database lama, otomatis di-restore
+  lebih dulu sebelum bot dijalankan.
+- Konfigurasi tersimpan di `.env`: `GH_BACKUP_ENABLED`, `GH_BACKUP_PAT`,
+  `GH_BACKUP_REPO`, `GH_BACKUP_BRANCH` (default `main`), `GH_BACKUP_PATH`
+  (default `bot_data.db.gz`).
+- Kosongkan PAT saat instalasi kalau tidak ingin memakai fitur ini — bot tetap
+  berjalan normal tanpa backup GitHub.
 
 ## Keamanan
 - Token Bot & ID Owner wajib via environment variable (`TELEGRAM_BOT_TOKEN`,

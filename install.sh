@@ -186,15 +186,32 @@ print('Migrasi database selesai (kuota token per-user, model_tier, redeem token_
 }
 
 github_auto_setup() {
-  # Input hanya PAT. Username & repo di-auto-detect via GitHub API (TIDAK membuat repo baru,
-  # supaya kompatibel dengan Fine-grained PAT yang dikunci ke 1 repo spesifik).
+  # -----------------------------------------------------------------------
+  # DESAIN BARU (jauh lebih sederhana dari versi sebelumnya):
+  #
+  # Versi lama membuat git repo TAMBAHAN persis di ${APP_DIR} (folder yang
+  # sama dengan clone source code bot), lalu commit+push database.db ke situ
+  # tiap 60 detik. Ini punya 2 bug serius:
+  #   1. Setiap push ikut mengirim SELURUH source code bot (bukan cuma
+  #      database) ke repo backup, dan riwayatnya menumpuk tanpa batas.
+  #   2. Saat menu Update jalan (`git reset --hard origin/main`), commit
+  #      auto-backup tadi ikut ke-reset -> file database bisa TERHAPUS dari
+  #      server, karena secara tidak sengaja "dianggap" bagian dari git
+  #      repo source code.
+  #
+  # Sekarang: backup/restore database TIDAK memakai `git` sama sekali,
+  # murni lewat GitHub REST API (curl), dan disimpan terpisah total dari
+  # git repo source code bot. Auto-backup rutin tiap 60 detik dilakukan
+  # oleh bot.py lewat modul github_backup.py (Python), bukan oleh script ini.
+  # -----------------------------------------------------------------------
   echo -e "${BOLD}=================================================================${NC}"
   echo -e "${BOLD}   GITHUB BACKUP & RESTORE DATABASE (OTOMATIS)${NC}"
   echo -e "${BOLD}=================================================================${NC}"
   echo ""
   echo -e "${YELLOW}⚠️ MASUKKAN GITHUB PERSONAL ACCESS TOKEN (PAT) ⚠️${NC}"
   echo -e "Rekomendasi: Gunakan Fine-grained PAT yang di-scope ke 1 repo backup"
-  echo -e "khusus, dengan akses \"Repository permissions\" -> \"Contents\" -> \"Read and write\"."
+  echo -e "khusus (TERPISAH dari repo source code bot), dengan akses"
+  echo -e "\"Repository permissions\" -> \"Contents\" -> \"Read and write\"."
   echo -e "--------------------------------------------------"
   read -r -p "GitHub PAT (kosongkan untuk skip fitur backup): " GH_PAT_INPUT < "${TTY_IN}"
   echo ""
@@ -204,92 +221,78 @@ github_auto_setup() {
     return 0
   fi
 
-  log_info "Memverifikasi PAT & mendeteksi username GitHub..."
-  GH_USER_JSON="$(curl -sf -H "Authorization: Bearer ${GH_PAT_INPUT}" -H "Accept: application/vnd.github+json" https://api.github.com/user || true)"
-  GH_USERNAME="$(echo "${GH_USER_JSON}" | grep -o '"login"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
-
-  if [[ -z "${GH_USERNAME}" ]]; then
-    log_error "PAT tidak valid / gagal menghubungi GitHub API. Fitur backup/restore dilewati."
-    return 0
-  fi
-  log_success "Terautentikasi sebagai GitHub user: ${GH_USERNAME}"
-
-  log_info "Mendeteksi repo yang diizinkan oleh PAT ini..."
-  REPOS_RESPONSE="$(curl -s -w '\n%{http_code}' -H "Authorization: Bearer ${GH_PAT_INPUT}" -H "Accept: application/vnd.github+json" "https://api.github.com/user/repos?per_page=100&sort=updated")"
-  REPOS_STATUS="$(echo "${REPOS_RESPONSE}" | tail -n1)"
-  REPOS_BODY="$(echo "${REPOS_RESPONSE}" | sed '$d')"
-
-  if [[ "${REPOS_STATUS}" != "200" ]]; then
-    log_error "Gagal mengambil daftar repo (HTTP ${REPOS_STATUS}). Fitur backup/restore dilewati."
-    return 0
-  fi
-
-  # Nama repo source code bot ini sendiri (dari REPO_GIT_URL) -> JANGAN pernah dipakai
-  # sebagai remote backup, walaupun PAT punya akses ke situ juga.
-  SELF_REPO_NAME="$(basename "${REPO_GIT_URL}" .git)"
-
-  # Ambil SEMUA nama repo (field "name" milik object repo) dari respons JSON, lalu buang duplikat.
-  mapfile -t ALL_REPOS < <(echo "${REPOS_BODY}" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]+)"$/\1/' | awk '!seen[$0]++')
-
-  # Buang repo source code bot dari daftar kandidat backup.
-  CANDIDATE_REPOS=()
-  for r in "${ALL_REPOS[@]}"; do
-    [[ "${r}" != "${SELF_REPO_NAME}" ]] && CANDIDATE_REPOS+=("${r}")
+  read -r -p "Repo tujuan backup, format owner/repo (contoh: budi/bot-backup): " GH_REPO_INPUT < "${TTY_IN}"
+  while [[ -z "${GH_REPO_INPUT// }" || "${GH_REPO_INPUT}" != */* ]]; do
+    log_warn "Format harus owner/repo (contoh: budi/bot-backup)."
+    read -r -p "Repo tujuan backup, format owner/repo: " GH_REPO_INPUT < "${TTY_IN}"
   done
 
-  if [[ "${#CANDIDATE_REPOS[@]}" -eq 0 ]]; then
-    log_error "PAT ini hanya punya akses ke repo source code bot (${SELF_REPO_NAME}) atau tidak ada repo sama sekali."
-    log_error "Buat/scope PAT ke repo backup KHUSUS (terpisah dari repo source code bot)."
-    log_error "Fitur backup/restore dilewati."
+  read -r -p "Branch repo backup [default: main]: " GH_BRANCH_INPUT < "${TTY_IN}"
+  GH_BRANCH_INPUT="${GH_BRANCH_INPUT:-main}"
+
+  # Repo backup TIDAK BOLEH sama dengan repo source code bot ini sendiri —
+  # kalau sama, backup database akan tertimpa/bercampur dengan source code.
+  SELF_REPO_NAME="$(basename "${REPO_GIT_URL}" .git)"
+  if [[ "${GH_REPO_INPUT##*/}" == "${SELF_REPO_NAME}" ]]; then
+    log_error "Repo backup tidak boleh sama dengan repo source code bot (${SELF_REPO_NAME})."
+    log_error "Gunakan repo terpisah khusus untuk backup database. Fitur backup dilewati."
     return 0
-  elif [[ "${#CANDIDATE_REPOS[@]}" -eq 1 ]]; then
-    GH_DETECTED_REPO="${CANDIDATE_REPOS[0]}"
-    log_success "Repo terdeteksi: ${GH_USERNAME}/${GH_DETECTED_REPO} (akan dipakai sebagai remote backup)."
-  else
-    log_warn "PAT ini punya akses ke lebih dari 1 repo, pilih mana yang dipakai untuk backup database:"
-    for i in "${!CANDIDATE_REPOS[@]}"; do
-      echo -e "  ${GREEN}[$((i+1))]${NC} ${CANDIDATE_REPOS[$i]}"
-    done
-    read -r -p "Masukkan nomor repo [1-${#CANDIDATE_REPOS[@]}]: " REPO_CHOICE < "${TTY_IN}"
-    while ! [[ "${REPO_CHOICE}" =~ ^[0-9]+$ ]] || (( REPO_CHOICE < 1 || REPO_CHOICE > ${#CANDIDATE_REPOS[@]} )); do
-      log_warn "Pilihan tidak valid."
-      read -r -p "Masukkan nomor repo [1-${#CANDIDATE_REPOS[@]}]: " REPO_CHOICE < "${TTY_IN}"
-    done
-    GH_DETECTED_REPO="${CANDIDATE_REPOS[$((REPO_CHOICE-1))]}"
-    log_success "Repo dipilih: ${GH_USERNAME}/${GH_DETECTED_REPO}"
   fi
 
-  GH_REMOTE_URL="https://${GH_PAT_INPUT}@github.com/${GH_USERNAME}/${GH_DETECTED_REPO}.git"
+  log_info "Memverifikasi akses PAT ke ${GH_REPO_INPUT}..."
+  GH_CHECK_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${GH_PAT_INPUT}" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${GH_REPO_INPUT}")"
 
-  log_info "Menyiapkan git remote 'db-backup' di ${APP_DIR}..."
-  git config --global --add safe.directory "${APP_DIR}" || true
-  if [[ ! -d "${APP_DIR}/.git" ]]; then
-    git -C "${APP_DIR}" init -q
+  if [[ "${GH_CHECK_STATUS}" != "200" ]]; then
+    log_error "Tidak bisa mengakses ${GH_REPO_INPUT} dengan PAT ini (HTTP ${GH_CHECK_STATUS})."
+    log_error "Pastikan repo sudah ada dan PAT punya akses Contents: Read and write ke repo tsb."
+    log_error "Fitur backup/restore dilewati (bisa disetel lagi lewat menu Update)."
+    return 0
   fi
-  # Identitas commit lokal ke repo ini (bukan --global) supaya auto-backup di bot.py
-  # tetap bisa commit walau dijalankan sebagai service user (mis. 'aibot') yang tidak
-  # punya home directory / git config global sendiri.
-  git -C "${APP_DIR}" config user.name "BimXYZ Auto Backup"
-  git -C "${APP_DIR}" config user.email "auto-backup@bimxyz.local"
-  if git -C "${APP_DIR}" remote get-url db-backup &>/dev/null; then
-    git -C "${APP_DIR}" remote set-url db-backup "${GH_REMOTE_URL}"
-  else
-    git -C "${APP_DIR}" remote add db-backup "${GH_REMOTE_URL}"
-  fi
+  log_success "Akses ke ${GH_REPO_INPUT} terverifikasi."
 
-  log_info "Mengecek apakah ada ${DB_FILE_NAME} lama di remote backup untuk di-restore..."
-  TMP_RESTORE="$(mktemp -d)"
-  if git clone -q --depth 1 "${GH_REMOTE_URL}" "${TMP_RESTORE}" 2>/dev/null; then
-    if [[ -f "${TMP_RESTORE}/${DB_FILE_NAME}" ]]; then
-      cp -f "${TMP_RESTORE}/${DB_FILE_NAME}" "${APP_DIR}/${DB_FILE_NAME}"
+  GH_BACKUP_REPO="${GH_REPO_INPUT}"
+  GH_BACKUP_BRANCH="${GH_BRANCH_INPUT}"
+  GH_BACKUP_PATH="${DB_FILE_NAME}.gz"
+
+  log_info "Mengecek apakah ada backup database lama di ${GH_BACKUP_REPO}..."
+  GH_RESTORE_JSON="$(mktemp)"
+  GH_RESTORE_STATUS="$(curl -s -o "${GH_RESTORE_JSON}" -w '%{http_code}' \
+    -H "Authorization: Bearer ${GH_PAT_INPUT}" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${GH_BACKUP_REPO}/contents/${GH_BACKUP_PATH}?ref=${GH_BACKUP_BRANCH}")"
+
+  if [[ "${GH_RESTORE_STATUS}" == "200" ]]; then
+    # Parsing JSON + decode base64 + gunzip dilakukan lewat python3 (bukan
+    # grep/sed) karena field "content" dari GitHub adalah base64 yang berisi
+    # escape newline literal ("\n") di dalam string JSON — python's json
+    # module & base64.b64decode menangani ini dengan benar, sedangkan
+    # grep/sed/tr gampang salah dan menghasilkan file korup.
+    if python3 - "${GH_RESTORE_JSON}" "${APP_DIR}/${DB_FILE_NAME}" <<'PYEOF'
+import base64
+import gzip
+import json
+import sys
+
+json_path, dest_path = sys.argv[1], sys.argv[2]
+with open(json_path) as f:
+    data = json.load(f)
+raw = base64.b64decode(data["content"])
+db_bytes = gzip.decompress(raw)
+with open(dest_path, "wb") as out:
+    out.write(db_bytes)
+PYEOF
+    then
       log_success "Database lama ditemukan di GitHub, berhasil di-restore ke ${APP_DIR}/${DB_FILE_NAME}."
     else
-      log_warn "Repo backup ada tapi belum ada ${DB_FILE_NAME} di dalamnya (kemungkinan install pertama kali)."
+      log_warn "Ada file di ${GH_BACKUP_PATH} tapi gagal di-decode, database lokal tidak diubah."
     fi
   else
-    log_warn "Belum bisa clone repo backup (repo kosong/baru). Backup pertama akan dibuat otomatis oleh bot."
+    log_warn "Belum ada backup di ${GH_BACKUP_REPO} (kemungkinan install pertama kali). Backup pertama akan dibuat otomatis oleh bot."
   fi
-  rm -rf "${TMP_RESTORE}"
+  rm -f "${GH_RESTORE_JSON}"
 
   GH_BACKUP_ENABLED="true"
 
@@ -297,11 +300,13 @@ github_auto_setup() {
   # untuk fresh install, baris ini juga ditulis ulang oleh blok cat > .env utama.
   if [[ -f "${ENV_FILE}" ]]; then
     umask 077
-    sed -i '/^GH_BACKUP_ENABLED=/d;/^GH_BACKUP_PAT=/d;/^GH_BACKUP_REPO=/d' "${ENV_FILE}"
+    sed -i '/^GH_BACKUP_ENABLED=/d;/^GH_BACKUP_PAT=/d;/^GH_BACKUP_REPO=/d;/^GH_BACKUP_BRANCH=/d;/^GH_BACKUP_PATH=/d' "${ENV_FILE}"
     {
       echo "GH_BACKUP_ENABLED=true"
       echo "GH_BACKUP_PAT=${GH_PAT_INPUT}"
-      echo "GH_BACKUP_REPO=${GH_USERNAME}/${GH_DETECTED_REPO}"
+      echo "GH_BACKUP_REPO=${GH_BACKUP_REPO}"
+      echo "GH_BACKUP_BRANCH=${GH_BACKUP_BRANCH}"
+      echo "GH_BACKUP_PATH=${GH_BACKUP_PATH}"
     } >> "${ENV_FILE}"
     chmod 600 "${ENV_FILE}"
   fi
@@ -423,9 +428,12 @@ print_footer() {
   echo ""
   if grep -q '^GH_BACKUP_ENABLED=true' "${ENV_FILE}" 2>/dev/null; then
     GH_REPO_DISPLAY="$(grep '^GH_BACKUP_REPO=' "${ENV_FILE}" | cut -d= -f2)"
+    GH_BRANCH_DISPLAY="$(grep '^GH_BACKUP_BRANCH=' "${ENV_FILE}" | cut -d= -f2)"
+    GH_PATH_DISPLAY="$(grep '^GH_BACKUP_PATH=' "${ENV_FILE}" | cut -d= -f2)"
     echo -e "${BLUE}${BOLD}   BACKUP OTOMATIS DATABASE KE GITHUB${NC}"
-    echo -e "   Status   : ${GREEN}AKTIF${NC} (auto-push tiap 60 detik jika ada perubahan)"
-    echo -e "   Repo     : ${GREEN}https://github.com/${GH_REPO_DISPLAY}${NC}"
+    echo -e "   Status   : ${GREEN}AKTIF${NC} (upload lewat GitHub API tiap 60 detik jika ada perubahan)"
+    echo -e "   Repo     : ${GREEN}https://github.com/${GH_REPO_DISPLAY}/blob/${GH_BRANCH_DISPLAY:-main}/${GH_PATH_DISPLAY:-${DB_FILE_NAME}.gz}${NC}"
+    echo -e "   Metode   : REST API murni (bukan git) — repo source code bot tidak pernah tersentuh."
     echo ""
   fi
   echo -e "${BLUE}${BOLD}8. CARA UPDATE DI MASA DEPAN${NC}"
@@ -463,8 +471,10 @@ run_update_flow() {
   if [[ -d "${APP_DIR}/.git" ]]; then
     log_info "Menjalankan git pull di ${APP_DIR}..."
     git config --global --add safe.directory "${APP_DIR}" || true
-    # Pastikan remote 'origin' (source code bot) selalu ada & benar, terlepas dari
-    # remote 'db-backup' yang mungkin sudah ditambahkan oleh github_auto_setup sebelumnya.
+    # Catatan: backup database (github_auto_setup) TIDAK PERNAH memakai git
+    # sama sekali (lihat github_backup.py), jadi repo ${APP_DIR} ini murni
+    # berisi source code bot. `reset --hard` di bawah aman dan tidak akan
+    # pernah menyentuh bot_data.db (file itu untracked / ada di .gitignore).
     if git -C "${APP_DIR}" remote get-url origin &>/dev/null; then
       git -C "${APP_DIR}" remote set-url origin "${REPO_GIT_URL}"
     else
@@ -552,6 +562,18 @@ run_fresh_install_flow() {
     rm -rf "${TMP_CLONE}"
   fi
   log_success "File aplikasi berhasil disiapkan."
+
+  # Proteksi tambahan (local-only, tidak ikut ke-reset oleh git pull upstream):
+  # pastikan .env & file database TIDAK PERNAH bisa ikut ter-track oleh repo
+  # source code bot ini, seandainya ada yang menjalankan `git add .` manual.
+  if [[ -d "${APP_DIR}/.git" ]]; then
+    {
+      echo ".env"
+      echo "${DB_FILE_NAME}"
+      echo "${DB_FILE_NAME}.gz"
+      echo "venv/"
+    } > "${APP_DIR}/.git/info/exclude"
+  fi
   echo ""
 
   setup_python_venv
@@ -597,7 +619,9 @@ TELEGRAM_BOT_TOKEN=${BOT_TOKEN_INPUT}
 OWNER_TELEGRAM_ID=${OWNER_ID_INPUT}
 GH_BACKUP_ENABLED=${GH_BACKUP_ENABLED:-false}
 GH_BACKUP_PAT=${GH_PAT_INPUT:-}
-GH_BACKUP_REPO=${GH_USERNAME:-}/${GH_DETECTED_REPO:-}
+GH_BACKUP_REPO=${GH_BACKUP_REPO:-}
+GH_BACKUP_BRANCH=${GH_BACKUP_BRANCH:-main}
+GH_BACKUP_PATH=${GH_BACKUP_PATH:-${DB_FILE_NAME}.gz}
 EOF
   chmod 600 "${ENV_FILE}"
   log_success "Konfigurasi bot berhasil disimpan secara aman (chmod 600, tidak ada di source code)."

@@ -52,6 +52,7 @@ from telegram.error import TelegramError, BadRequest
 
 import database as db
 import ai_engine as engine
+import github_backup as ghbackup
 
 # =========================================================================
 # KONFIGURASI
@@ -80,11 +81,17 @@ DB_PATH = os.environ.get("AI_BOT_DB_PATH", "bot_data.db")
 db.set_db_path(DB_PATH)
 
 # --- GitHub Backup & Restore (otomatis, dikonfigurasi lewat install.sh) ---
+# Catatan desain: backup HANYA lewat GitHub REST API (lihat github_backup.py),
+# TIDAK PERNAH memakai git di working directory bot (yang juga dipakai untuk
+# `git pull` source code lewat install.sh) — supaya proses update kode tidak
+# pernah bisa menimpa/menghapus database, dan supaya PAT tidak perlu
+# tersimpan di remote URL git.
 GH_BACKUP_ENABLED = os.environ.get("GH_BACKUP_ENABLED", "false").lower() == "true"
 GH_BACKUP_PAT = os.environ.get("GH_BACKUP_PAT", "")
+GH_BACKUP_REPO = os.environ.get("GH_BACKUP_REPO", "")  # format "owner/repo"
+GH_BACKUP_BRANCH = os.environ.get("GH_BACKUP_BRANCH", "main")
+GH_BACKUP_PATH = os.environ.get("GH_BACKUP_PATH", "bot_data.db.gz")
 GH_BACKUP_INTERVAL_SEC = 60
-_APP_DIR = os.path.dirname(os.path.abspath(DB_PATH)) or "."
-_DB_BASENAME = os.path.basename(DB_PATH)
 
 PIN_TAG_RE = re.compile(r"\[PIN\]", re.IGNORECASE)
 
@@ -306,7 +313,8 @@ def escape_markdown_v1(text: str) -> str:
 
 
 # =========================================================================
-# BACKGROUND TASK: AUTO-BACKUP database.db KE GITHUB TIAP 60 DETIK
+# BACKGROUND TASK: AUTO-BACKUP DATABASE KE GITHUB TIAP 60 DETIK
+# (lihat github_backup.py — upload lewat REST API, tanpa git sama sekali)
 # =========================================================================
 
 def _file_hash(path: str) -> Optional[str]:
@@ -320,64 +328,39 @@ def _file_hash(path: str) -> Optional[str]:
         return None
 
 
-def _run_git(args: list, cwd: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=60
-    )
-
-
-def _git_push_db_sync() -> None:
-    """Jalan di thread terpisah (blocking OK di sini): commit + push database.db ke remote db-backup."""
-    import time as _time
-
-    if not os.path.isdir(os.path.join(_APP_DIR, ".git")):
-        logger.warning("GH backup: %s bukan git repo, skip push.", _APP_DIR)
-        return
-
-    if not os.path.isfile(DB_PATH):
-        logger.warning("GH backup: %s tidak ditemukan, skip push.", DB_PATH)
-        return
-
-    add_result = _run_git(["add", _DB_BASENAME], cwd=_APP_DIR)
-    if add_result.returncode != 0:
-        logger.warning("GH backup: git add gagal: %s", add_result.stderr.strip())
-        return
-
-    commit_msg = f"Auto-backup DB: {_time.strftime('%Y-%m-%d %H:%M:%S')}"
-    commit_result = _run_git(["commit", "-m", commit_msg], cwd=_APP_DIR)
-    if commit_result.returncode != 0 and "nothing to commit" not in commit_result.stdout.lower():
-        logger.warning("GH backup: git commit gagal: %s", commit_result.stderr.strip())
-        return
-
-    for branch in ("main", "master"):
-        push_result = _run_git(["push", "db-backup", f"HEAD:{branch}"], cwd=_APP_DIR)
-        if push_result.returncode == 0:
-            logger.info("GH backup: %s berhasil di-push ke branch %s.", _DB_BASENAME, branch)
-            return
-        logger.warning("GH backup: push ke %s gagal: %s", branch, push_result.stderr.strip())
-    logger.warning("GH backup: git push gagal ke main maupun master.")
-
-
 async def github_auto_backup_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Loop background: cek hash database.db tiap 60 detik, push ke GitHub hanya jika berubah."""
+    """Loop background: cek hash database tiap 60 detik, upload ke GitHub hanya jika berubah."""
     last_hash: Optional[str] = None
     while True:
         try:
             current_hash = _file_hash(DB_PATH)
             if current_hash is not None and current_hash != last_hash:
-                await asyncio.to_thread(_git_push_db_sync)
-                last_hash = current_hash
+                ok = await asyncio.to_thread(
+                    ghbackup.push_backup,
+                    GH_BACKUP_PAT,
+                    GH_BACKUP_REPO,
+                    GH_BACKUP_PATH,
+                    GH_BACKUP_BRANCH,
+                    DB_PATH,
+                )
+                if ok:
+                    last_hash = current_hash
         except Exception:
             logger.exception("GH backup: error tak terduga di loop auto-backup")
         await asyncio.sleep(GH_BACKUP_INTERVAL_SEC)
 
 
 async def _post_init_start_backup(application: Application) -> None:
-    if not (GH_BACKUP_ENABLED and GH_BACKUP_PAT):
-        logger.info("GH backup: dinonaktifkan (GH_BACKUP_ENABLED != true atau PAT kosong).")
+    if not (GH_BACKUP_ENABLED and GH_BACKUP_PAT and GH_BACKUP_REPO):
+        logger.info(
+            "GH backup: dinonaktifkan (GH_BACKUP_ENABLED != true, atau PAT/repo belum diset)."
+        )
         return
     application.create_task(github_auto_backup_loop(application))
-    logger.info("GH backup: auto-backup database.db tiap %ss AKTIF.", GH_BACKUP_INTERVAL_SEC)
+    logger.info(
+        "GH backup: auto-backup ke %s (%s) tiap %ss AKTIF.",
+        GH_BACKUP_REPO, GH_BACKUP_PATH, GH_BACKUP_INTERVAL_SEC,
+    )
 
 
 # =========================================================================
