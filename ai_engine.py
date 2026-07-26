@@ -7,8 +7,19 @@ diadaptasi dari backend FastAPI versi sebelumnya, dilepas dari layer HTTP
 agar bisa dipakai langsung oleh bot Telegram (python-telegram-bot).
 
 Model yang dipakai:
-  - qwen2.5-coder:14b  -> chat/coding (text-only)
-  - qwen2.5vl          -> analisis gambar & video (vision)
+  - Sistem 3 Tier (chat/coding, text-only), dipilih user lewat /model:
+        🟢 Light  -> qwen2.5-coder:1.5b  (multiplier kuota token 1x)
+        🟡 Medium -> qwen2.5-coder:7b    (multiplier kuota token 2x, default)
+        🔴 Heavy  -> qwen2.5-coder:14b   (multiplier kuota token 3x)
+  - qwen2.5vl -> analisis gambar & video (vision, di luar sistem tier/kuota)
+
+Stabilitas & Timeout:
+  - Timeout HTTP ke Ollama diset 600 detik (10 menit) agar request context
+    panjang / model besar tidak terputus prematur (fix HTTP 500 lama).
+  - Semua payload chat menyertakan options={"num_ctx": 2048} agar prompt
+    processing tidak melambat akibat context window default yang terlalu besar.
+  - Semua error (termasuk timeout) ditangani sebagai AIEngineError dengan
+    pesan ramah-user, tidak pernah membuat proses Python crash.
 """
 
 import os
@@ -19,7 +30,7 @@ import subprocess
 import tempfile
 import shutil
 import logging
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 import requests
 
@@ -35,16 +46,41 @@ class AIEngineError(Exception):
 
 
 # =========================================================================
-# KONFIGURASI (diisi lewat env vars, lihat bot.py)
+# KONFIGURASI (diisi lewat env vars, lihat bot.py / install.sh)
 # =========================================================================
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:14b")
+
+# --- Sistem 3 Tier Model ---
+MODEL_TIERS: Dict[str, str] = {
+    "light": os.environ.get("OLLAMA_MODEL_LIGHT", "qwen2.5-coder:1.5b"),
+    "medium": os.environ.get("OLLAMA_MODEL_MEDIUM", "qwen2.5-coder:7b"),
+    "heavy": os.environ.get("OLLAMA_MODEL_HEAVY", "qwen2.5-coder:14b"),
+}
+
+# Multiplier kuota token berdasarkan beban CPU tiap tier.
+# Contoh: 1.000 token asli hasil Ollama pada tier medium (2x) memotong 2.000 token kuota user.
+TOKEN_MULTIPLIER: Dict[str, int] = {
+    "light": 1,
+    "medium": 2,
+    "heavy": 3,
+}
+
+DEFAULT_MODEL_TIER = "medium"
+OLLAMA_MODEL = MODEL_TIERS[DEFAULT_MODEL_TIER]  # dipakai untuk logging start-up saja
+
 OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "qwen2.5vl")
 
 MAX_HISTORY_MESSAGES = 20
-REQUEST_TIMEOUT_SECONDS = 300
-VISION_TIMEOUT_SECONDS = 300
+
+# Timeout HTTP client ke Ollama: 600 detik (10 menit) — lihat catatan modul di atas.
+REQUEST_TIMEOUT_SECONDS = 600.0
+VISION_TIMEOUT_SECONDS = 600.0
+
+# Context window default Ollama. Nilai kecil (2048) menjaga prompt processing tetap cepat;
+# bisa dinaikkan lewat env var OLLAMA_NUM_CTX jika benar-benar butuh context lebih panjang
+# (dengan konsekuensi prompt processing lebih lambat).
+DEFAULT_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "2048"))
 
 MAX_FILES_IN_ZIP = 20
 MAX_ZIP_EXTRACTED_TOTAL_BYTES = 200 * 1024 * 1024  # 200 MB
@@ -53,6 +89,14 @@ MAX_EXTRACTED_CHARS = 200_000
 VIDEO_SAMPLE_FRAMES = 4
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
+
+
+def resolve_model(tier: Optional[str]) -> str:
+    """Mengembalikan nama model Ollama untuk tier tertentu, fallback ke tier default jika tidak valid."""
+    if tier not in MODEL_TIERS:
+        tier = DEFAULT_MODEL_TIER
+    return MODEL_TIERS[tier]
+
 
 # =========================================================================
 # DETEKSI JENIS FILE
@@ -142,6 +186,7 @@ def call_ollama_vision(image_bytes: bytes, prompt: str) -> str:
         "prompt": prompt,
         "images": [image_b64],
         "stream": False,
+        "options": {"num_ctx": DEFAULT_NUM_CTX},
     }
     try:
         resp = requests.post(url, json=payload, timeout=VISION_TIMEOUT_SECONDS)
@@ -156,7 +201,11 @@ def call_ollama_vision(image_bytes: bytes, prompt: str) -> str:
         )
     except requests.exceptions.Timeout:
         logger.error("Request vision ke Ollama timeout setelah %s detik", VISION_TIMEOUT_SECONDS)
-        raise AIEngineError("timeout", "Request analisis gambar timeout. Coba lagi.")
+        raise AIEngineError(
+            "timeout",
+            "⏳ Analisis gambar/video melebihi waktu tunggu (10 menit). Server sedang sibuk "
+            "atau file terlalu kompleks. Coba lagi dalam beberapa saat.",
+        )
     except requests.exceptions.HTTPError as e:
         logger.error("Ollama (vision) mengembalikan error HTTP: %s", e)
         raise AIEngineError(
@@ -388,7 +437,7 @@ def process_uploaded_file(filename: str, content: bytes) -> Dict[str, object]:
 
 
 # =========================================================================
-# INTEGRASI OLLAMA (CHAT/CODING)
+# INTEGRASI OLLAMA (CHAT/CODING) - SISTEM 3 TIER + TOKEN ACCOUNTING
 # =========================================================================
 
 def build_prompt_context(history: List[dict], new_message: str) -> List[dict]:
@@ -403,19 +452,40 @@ def build_prompt_context(history: List[dict], new_message: str) -> List[dict]:
     return messages
 
 
-def call_ollama_chat(messages: List[dict]) -> str:
-    """Mengirim request ke Ollama /api/chat dan mengembalikan teks jawaban."""
+def call_ollama_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
+    """
+    Mengirim request ke Ollama /api/chat dan mengembalikan dict:
+      {
+        "content": str,            # jawaban model
+        "prompt_tokens": int,      # dari field 'prompt_eval_count' Ollama
+        "completion_tokens": int,  # dari field 'eval_count' Ollama
+        "total_tokens": int,       # prompt_tokens + completion_tokens
+      }
+    Timeout diset 600 detik (10 menit) dan context window diset num_ctx=2048
+    secara default agar prompt processing tidak lambat.
+    """
     url = f"{OLLAMA_HOST}/api/chat"
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": model_name,
         "messages": messages,
         "stream": False,
+        "options": {"num_ctx": DEFAULT_NUM_CTX},
     }
     try:
         resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("message", {}).get("content", "").strip() or "[Model tidak mengembalikan jawaban]"
+
+        content = data.get("message", {}).get("content", "").strip() or "[Model tidak mengembalikan jawaban]"
+        prompt_tokens = int(data.get("prompt_eval_count") or 0)
+        completion_tokens = int(data.get("eval_count") or 0)
+
+        return {
+            "content": content,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
     except requests.exceptions.ConnectionError as e:
         logger.error("Tidak bisa terhubung ke Ollama di %s: %s", OLLAMA_HOST, e)
         raise AIEngineError(
@@ -423,17 +493,31 @@ def call_ollama_chat(messages: List[dict]) -> str:
             f"Tidak dapat terhubung ke Ollama di {OLLAMA_HOST}. Pastikan service Ollama berjalan.",
         )
     except requests.exceptions.Timeout:
-        logger.error("Request ke Ollama timeout setelah %s detik", REQUEST_TIMEOUT_SECONDS)
-        raise AIEngineError("timeout", "Request ke model AI timeout. Coba lagi.")
+        logger.error(
+            "Request ke Ollama (model=%s) timeout setelah %s detik", model_name, REQUEST_TIMEOUT_SECONDS
+        )
+        raise AIEngineError(
+            "timeout",
+            "⏳ AI sedang memproses context yang panjang dan melebihi waktu tunggu (10 menit). "
+            "Coba kirim pesan yang lebih singkat, gunakan /reset untuk memulai percakapan baru, "
+            "atau coba lagi dalam beberapa saat.",
+        )
     except requests.exceptions.HTTPError as e:
         logger.error("Ollama mengembalikan error HTTP: %s", e)
-        raise AIEngineError(str(e), f"Ollama mengembalikan error: {e}")
+        raise AIEngineError(
+            str(e),
+            f"Ollama mengembalikan error: {e}. Pastikan model '{model_name}' sudah di-pull "
+            f"(ollama pull {model_name}).",
+        )
     except Exception as e:
         logger.exception("Error tak terduga saat memanggil Ollama")
         raise AIEngineError(str(e), f"Error tak terduga saat memanggil model AI: {e}")
 
 
-def chat(user_token: str, user_message: str, history: List[dict]) -> str:
-    """High-level helper: bangun konteks dari history + pesan baru, panggil Ollama, kembalikan jawaban."""
+def chat(user_message: str, history: List[dict], model_name: str) -> Dict[str, Any]:
+    """
+    High-level helper: bangun konteks dari history + pesan baru, panggil Ollama
+    dengan model tier yang dipilih user, kembalikan dict (lihat call_ollama_chat).
+    """
     messages = build_prompt_context(history, user_message)
-    return call_ollama_chat(messages)
+    return call_ollama_chat(messages, model_name)

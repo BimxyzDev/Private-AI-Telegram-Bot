@@ -2,15 +2,23 @@
 Private AI Telegram Bot
 ==========================
 Bot Telegram (mode polling) yang menghubungkan user ke:
-  - qwen2.5-coder:14b  -> chat/coding (text-only)
-  - qwen2.5vl          -> analisis gambar & video (vision)
+  - Sistem 3 Tier model chat/coding, dipilih user lewat /model:
+        🟢 Light  -> qwen2.5-coder:1.5b  (kuota token x1)
+        🟡 Medium -> qwen2.5-coder:7b    (kuota token x2, default)
+        🔴 Heavy  -> qwen2.5-coder:14b   (kuota token x3)
+  - qwen2.5vl  -> analisis gambar & video (vision)
 
 Fitur:
-  - Setiap user mendapat limit 20 chat/hari (reset otomatis tiap hari)
-  - Owner bisa generate kode redeem (/gencode) untuk menaikkan limit user
+  - Setiap user mendapat kuota 50.000 TOKEN/hari (reset otomatis tiap 24 jam),
+    dipotong sesuai jumlah token asli dari Ollama dikali multiplier tier model.
+  - Owner bisa generate kode redeem (/gencode) untuk menaikkan kuota token user
     lain, termasuk ke "unlimited", dengan masa berlaku dalam hari. Setelah
-    masa berlaku habis, otomatis kembali ke limit default (20/hari).
+    masa berlaku habis, otomatis kembali ke kuota default (50.000/hari).
   - Upload dokumen/PDF/DOCX/gambar/video/ZIP tetap didukung penuh.
+  - Panggilan ke Ollama (bisa memakan waktu s/d 10 menit) dijalankan di thread
+    terpisah (asyncio.to_thread) dan Application berjalan dengan
+    concurrent_updates aktif, sehingga bot TIDAK hang/freeze untuk user lain
+    saat ada request yang sedang diproses lama.
 
 Jalankan dengan:
     python3 bot.py
@@ -19,16 +27,18 @@ Jalankan dengan:
 
 import os
 import io
+import asyncio
 import logging
 import html
 import traceback
 from typing import Optional
 
-from telegram import Update, constants
+from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -74,6 +84,17 @@ logging.basicConfig(
 logger = logging.getLogger("ai-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # kurangi noise log dari library HTTP internal
 
+MODEL_TIER_LABELS = {
+    "light": "🟢 Light (qwen2.5-coder:1.5b)",
+    "medium": "🟡 Medium (qwen2.5-coder:7b)",
+    "heavy": "🔴 Heavy (qwen2.5-coder:14b)",
+}
+MODEL_TIER_SHORT_LABELS = {
+    "light": "🟢 Light",
+    "medium": "🟡 Medium",
+    "heavy": "🔴 Heavy",
+}
+
 
 # =========================================================================
 # HELPER
@@ -86,6 +107,11 @@ def is_owner(telegram_id: int) -> bool:
 def user_token_for(telegram_id: int) -> str:
     """Token unik dipakai sebagai key riwayat chat di database (isolasi per-user)."""
     return f"tg-{telegram_id}"
+
+
+def format_number_id(n: int) -> str:
+    """Format angka dengan pemisah ribuan gaya Indonesia (titik), misal 50000 -> '50.000'."""
+    return f"{n:,}".replace(",", ".")
 
 
 async def send_long_message(update: Update, text: str) -> None:
@@ -136,8 +162,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Saya adalah *Private AI Assistant*. Kirim pesan apa saja untuk mulai chat/coding, "
         "atau kirim file (dokumen, PDF, DOCX, gambar, video, ZIP) untuk saya analisis.\n\n"
         "Perintah yang tersedia:\n"
-        "/status - lihat sisa limit chat kamu hari ini\n"
-        "/redeem <kode> - tukar kode redeem untuk menaikkan limit\n"
+        "/status - lihat sisa kuota token & model aktif kamu hari ini\n"
+        "/model - pilih tier model AI (Light/Medium/Heavy)\n"
+        "/redeem <kode> - tukar kode redeem untuk menaikkan kuota token\n"
         "/reset - hapus riwayat chat kamu (mulai percakapan baru)\n"
         "/help - tampilkan bantuan ini"
     )
@@ -149,6 +176,66 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =========================================================================
+# COMMAND: /model - pilih tier model AI
+# =========================================================================
+
+def _model_keyboard(current_tier: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for tier in ("light", "medium", "heavy"):
+        label = MODEL_TIER_SHORT_LABELS[tier]
+        if tier == current_tier:
+            label += " ✅"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"set_model:{tier}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    u = db.get_or_create_user(user.id, user.username)
+    current_tier = u["model_tier"]
+
+    text = (
+        "🤖 *Pilih Tier Model AI*\n\n"
+        "🟢 *Light* — qwen2.5-coder:1.5b\n"
+        "   Cepat, super irit CPU. Kuota token x1.\n\n"
+        "🟡 *Medium* — qwen2.5-coder:7b\n"
+        "   Seimbang (default). Kuota token x2.\n\n"
+        "🔴 *Heavy* — qwen2.5-coder:14b\n"
+        "   Reasoning & koding kompleks. Kuota token x3.\n\n"
+        f"Model aktif kamu saat ini: *{MODEL_TIER_LABELS[current_tier]}*"
+    )
+    await update.message.reply_text(
+        text,
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_markup=_model_keyboard(current_tier),
+    )
+
+
+async def callback_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = query.from_user
+    tier = (query.data or "").split(":", 1)[-1]
+
+    if tier not in db.VALID_MODEL_TIERS:
+        await query.answer("❌ Tier tidak valid.", show_alert=True)
+        return
+
+    db.get_or_create_user(user.id, user.username)
+    db.set_model_tier(user.id, tier)
+
+    await query.answer(f"Model diganti ke {MODEL_TIER_SHORT_LABELS[tier]}")
+    try:
+        await query.edit_message_text(
+            f"✅ Model aktif kamu sekarang: *{MODEL_TIER_LABELS[tier]}*\n\n"
+            "Kirim pesan untuk mulai chat dengan model ini.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=_model_keyboard(tier),
+        )
+    except TelegramError:
+        pass
+
+
+# =========================================================================
 # COMMAND: /status
 # =========================================================================
 
@@ -156,17 +243,23 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user = update.effective_user
     u = db.get_or_create_user(user.id, user.username)
 
+    tier = u["model_tier"]
+    model_line = f"Model aktif: *{MODEL_TIER_LABELS[tier]}*"
+
     if u["is_unlimited"]:
         limit_line = "♾️ *Unlimited*"
         sisa_line = f"Berlaku sampai: {format_time_remaining(u['plan_expires_at'])}"
     else:
-        sisa = max(u["daily_limit"] - u["chats_used_today"], 0)
-        limit_line = f"{u['chats_used_today']}/{u['daily_limit']} chat terpakai hari ini"
-        sisa_line = f"Sisa: *{sisa}* chat"
+        sisa = max(u["token_limit"] - u["tokens_used"], 0)
+        limit_line = (
+            f"{format_number_id(u['tokens_used'])}/{format_number_id(u['token_limit'])} "
+            "token terpakai hari ini"
+        )
+        sisa_line = f"Sisa: *{format_number_id(sisa)}* token"
         if u["plan_expires_at"]:
             sisa_line += f"\nPlan aktif sampai: {format_time_remaining(u['plan_expires_at'])}"
 
-    text = f"📊 *Status Kamu*\n\n{limit_line}\n{sisa_line}"
+    text = f"📊 *Status Kamu*\n\n{model_line}\n{limit_line}\n{sisa_line}"
     await update.message.reply_text(text, parse_mode=constants.ParseMode.MARKDOWN)
 
 
@@ -205,16 +298,16 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     db.apply_plan(
         telegram_id=user.id,
-        limit_value=record["limit_value"],
+        token_value=record["token_value"],
         is_unlimited=bool(record["is_unlimited"]),
         duration_days=record["duration_days"],
     )
     db.mark_code_redeemed(record["code"], user.id)
 
     if record["is_unlimited"]:
-        plan_desc = "♾️ *Unlimited chat*"
+        plan_desc = "♾️ *Unlimited token*"
     else:
-        plan_desc = f"*{record['limit_value']} chat/hari*"
+        plan_desc = f"*{format_number_id(record['token_value'])} token/hari*"
 
     await update.message.reply_text(
         f"✅ Kode berhasil ditukar!\n\nPlan kamu sekarang: {plan_desc}\n"
@@ -230,8 +323,8 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_gencode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Format:
-      /gencode <limit> <hari>       -> misal /gencode 50 30
-      /gencode unlimited <hari>     -> misal /gencode unlimited 365
+      /gencode <jumlah_token> <hari>   -> misal /gencode 100000 30
+      /gencode unlimited <hari>        -> misal /gencode unlimited 365 (khusus VIP/Owner)
     """
     user = update.effective_user
     if not is_owner(user.id):
@@ -241,13 +334,13 @@ async def cmd_gencode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if len(context.args) != 2:
         await update.message.reply_text(
             "Format:\n"
-            "`/gencode <limit> <hari>` — contoh: `/gencode 50 30`\n"
+            "`/gencode <jumlah_token> <hari>` — contoh: `/gencode 100000 30`\n"
             "`/gencode unlimited <hari>` — contoh: `/gencode unlimited 365`",
             parse_mode=constants.ParseMode.MARKDOWN,
         )
         return
 
-    limit_arg, days_arg = context.args
+    token_arg, days_arg = context.args
 
     try:
         duration_days = int(days_arg)
@@ -257,26 +350,26 @@ async def cmd_gencode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("❌ Jumlah hari harus berupa angka bulat positif.")
         return
 
-    if limit_arg.lower() == "unlimited":
+    if token_arg.lower() == "unlimited":
         code = db.create_redeem_code(
-            limit_value=0, is_unlimited=True, duration_days=duration_days, created_by=user.id
+            token_value=-1, is_unlimited=True, duration_days=duration_days, created_by=user.id
         )
-        plan_desc = "Unlimited chat"
+        plan_desc = "Unlimited token (VIP/Owner)"
     else:
         try:
-            limit_value = int(limit_arg)
-            if limit_value <= 0:
+            token_value = int(token_arg)
+            if token_value <= 0:
                 raise ValueError
         except ValueError:
             await update.message.reply_text(
-                "❌ Limit harus berupa angka bulat positif, atau kata kunci `unlimited`.",
+                "❌ Jumlah token harus berupa angka bulat positif, atau kata kunci `unlimited`.",
                 parse_mode=constants.ParseMode.MARKDOWN,
             )
             return
         code = db.create_redeem_code(
-            limit_value=limit_value, is_unlimited=False, duration_days=duration_days, created_by=user.id
+            token_value=token_value, is_unlimited=False, duration_days=duration_days, created_by=user.id
         )
-        plan_desc = f"{limit_value} chat/hari"
+        plan_desc = f"{format_number_id(token_value)} token/hari"
 
     await update.message.reply_text(
         f"✅ Kode redeem berhasil dibuat:\n\n"
@@ -302,7 +395,7 @@ async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = ["🎟️ *Kode Redeem Aktif (belum dipakai)*\n"]
     for c in codes:
-        plan = "Unlimited" if c["is_unlimited"] else f"{c['limit_value']} chat/hari"
+        plan = "Unlimited" if c["is_unlimited"] else f"{format_number_id(c['token_value'])} token/hari"
         lines.append(f"`{c['code']}` — {plan}, {c['duration_days']} hari")
 
     await send_long_message(update, "\n".join(lines))
@@ -321,9 +414,13 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [f"👥 *Total user: {total}*\n"]
     for u in users:
         uname = f"@{u['username']}" if u["username"] else "(no username)"
-        plan = "Unlimited" if u["is_unlimited"] else f"{u['chats_used_today']}/{u['daily_limit']}"
+        tier_flag = MODEL_TIER_SHORT_LABELS.get(u["model_tier"], u["model_tier"])
+        if u["is_unlimited"]:
+            plan = "Unlimited"
+        else:
+            plan = f"{format_number_id(u['tokens_used'])}/{format_number_id(u['token_limit'])} tok"
         ban_flag = " 🚫BANNED" if u["is_banned"] else ""
-        lines.append(f"`{u['telegram_id']}` {uname} — {plan}{ban_flag}")
+        lines.append(f"`{u['telegram_id']}` {uname} {tier_flag} — {plan}{ban_flag}")
 
     await send_long_message(update, "\n".join(lines))
 
@@ -392,7 +489,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def enforce_limit_or_reply(update: Update, telegram_id: int, username: Optional[str]) -> Optional[dict]:
     """
-    Mengecek apakah user boleh chat. Jika tidak (limit habis / banned), kirim pesan
+    Mengecek apakah user boleh chat. Jika tidak (kuota token habis / banned), kirim pesan
     penjelasan dan return None. Jika boleh, return data user.
     """
     u = db.get_or_create_user(telegram_id, username)
@@ -401,17 +498,27 @@ async def enforce_limit_or_reply(update: Update, telegram_id: int, username: Opt
         await update.effective_message.reply_text("🚫 Akun kamu telah dinonaktifkan oleh owner.")
         return None
 
-    if not db.can_chat(u):
+    if not db.can_use(u):
+        sisa = max(u["token_limit"] - u["tokens_used"], 0)
         await update.effective_message.reply_text(
-            f"⚠️ Limit chat harian kamu ({u['daily_limit']}/hari) sudah habis.\n\n"
-            "Limit akan reset otomatis besok, atau kamu bisa naikkan limit dengan kode redeem:\n"
+            f"⚠️ Kuota token harian kamu sudah habis "
+            f"({format_number_id(u['tokens_used'])}/{format_number_id(u['token_limit'])} token, sisa {sisa}).\n\n"
+            "Kuota akan reset otomatis besok, atau kamu bisa naikkan kuota dengan kode redeem:\n"
             "`/redeem <kode>`\n\n"
+            "Tips: model tier *Light* memotong kuota lebih sedikit (x1) dibanding *Heavy* (x3). "
+            "Ganti tier lewat /model.\n\n"
             "Hubungi owner bot untuk mendapatkan kode redeem.",
             parse_mode=constants.ParseMode.MARKDOWN,
         )
         return None
 
     return u
+
+
+def _deduct_tokens_for_tier(telegram_id: int, tier: str, total_tokens: int) -> None:
+    multiplier = engine.TOKEN_MULTIPLIER.get(tier, 1)
+    deduction = total_tokens * multiplier
+    db.add_token_usage(telegram_id, deduction)
 
 
 # =========================================================================
@@ -430,6 +537,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if u is None:
         return
 
+    tier = u["model_tier"]
+    model_name = engine.resolve_model(tier)
     token = user_token_for(telegram_user.id)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
 
@@ -437,10 +546,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         previous_history = db.get_history(token, limit=engine.MAX_HISTORY_MESSAGES)
         db.save_message(token, "user", user_message)
 
-        reply_text = engine.chat(token, user_message, previous_history)
+        # Panggilan ke Ollama bisa memakan waktu sampai 10 menit (timeout 600s).
+        # Dijalankan di thread terpisah agar event loop bot TIDAK terblokir/hang
+        # dan user lain tetap bisa dilayani secara bersamaan.
+        result = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name)
 
+        reply_text = result["content"]
         db.save_message(token, "assistant", reply_text)
-        db.increment_usage(telegram_user.id)
+        _deduct_tokens_for_tier(telegram_user.id, tier, result["total_tokens"])
 
         await send_long_message(update, reply_text)
     except engine.AIEngineError as e:
@@ -479,6 +592,8 @@ async def _process_and_reply_file(
         )
         return
 
+    tier = u["model_tier"]
+    model_name = engine.resolve_model(tier)
     token = user_token_for(telegram_user.id)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
     # Catatan: filename berasal dari user (nama file asli mereka) dan bisa berisi karakter
@@ -488,7 +603,9 @@ async def _process_and_reply_file(
     await message.reply_text(f"⏳ Memproses '{filename}'...")
 
     try:
-        result = engine.process_uploaded_file(filename, content)
+        # Ekstraksi/analisis file (termasuk panggilan vision) juga bisa memakan waktu lama
+        # (video/ZIP besar), jalankan di thread terpisah agar bot tetap responsif.
+        result = await asyncio.to_thread(engine.process_uploaded_file, filename, content)
         extracted_text = result["extracted_text"]
 
         caption = (message.caption or "").strip()
@@ -506,10 +623,11 @@ async def _process_and_reply_file(
         previous_history = db.get_history(token, limit=engine.MAX_HISTORY_MESSAGES)
         db.save_message(token, "user", user_message)
 
-        reply_text = engine.chat(token, user_message, previous_history)
+        result_chat = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name)
+        reply_text = result_chat["content"]
 
         db.save_message(token, "assistant", reply_text)
-        db.increment_usage(telegram_user.id)
+        _deduct_tokens_for_tier(telegram_user.id, tier, result_chat["total_tokens"])
 
         if result["truncated"]:
             await message.reply_text("ℹ️ Catatan: hasil ekstraksi file terpotong karena terlalu panjang.")
@@ -589,14 +707,25 @@ def main() -> None:
             "sampai ffmpeg diinstall (sudo apt-get install ffmpeg)."
         )
 
-    application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    # concurrent_updates diaktifkan agar panggilan Ollama yang lama (s/d 10 menit) untuk
+    # satu user TIDAK memblokir/hang bot untuk user lain yang sedang chat bersamaan.
+    application: Application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(8)
+        .build()
+    )
 
     # Command handlers
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("model", cmd_model))
     application.add_handler(CommandHandler("reset", cmd_reset))
     application.add_handler(CommandHandler("redeem", cmd_redeem))
+
+    # Callback query (inline button) handler untuk /model
+    application.add_handler(CallbackQueryHandler(callback_set_model, pattern=r"^set_model:"))
 
     # Owner-only admin commands
     application.add_handler(CommandHandler("gencode", cmd_gencode))
@@ -617,8 +746,8 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     logger.info(
-        "Private AI Telegram Bot siap. Model chat: %s | Model vision: %s | Ollama host: %s | Owner ID: %s",
-        engine.OLLAMA_MODEL, engine.OLLAMA_VISION_MODEL, engine.OLLAMA_HOST, OWNER_ID,
+        "Private AI Telegram Bot siap. Tier model: %s | Model vision: %s | Ollama host: %s | Owner ID: %s",
+        engine.MODEL_TIERS, engine.OLLAMA_VISION_MODEL, engine.OLLAMA_HOST, OWNER_ID,
     )
     logger.info("Menjalankan bot dalam mode polling...")
 

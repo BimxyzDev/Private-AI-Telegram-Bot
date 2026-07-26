@@ -3,8 +3,20 @@ Private AI Telegram Bot - Database Layer (SQLite)
 ====================================================
 Menyimpan tiga hal:
   - chats          : riwayat percakapan per user (untuk memori AI)
-  - users          : status limit chat harian tiap user (termasuk plan aktif & masa berlaku)
-  - redeem_codes   : kode redeem yang dibuat owner untuk menaikkan limit user
+  - users          : status kuota TOKEN harian tiap user, model tier aktif,
+                      plan aktif & masa berlaku
+  - redeem_codes   : kode redeem yang dibuat owner untuk menaikkan kuota token user
+
+=====================================================================
+CATATAN MIGRASI (v2 - Sistem Token + 3 Tier Model)
+=====================================================================
+Versi sebelumnya memakai kuota "N chat/hari" (kolom daily_limit,
+chats_used_today). Versi ini beralih ke kuota berbasis TOKEN
+(kolom token_limit, tokens_used) + kolom model_tier per-user
+(light/medium/heavy). init_db() otomatis menambahkan kolom baru ke
+database lama lewat ALTER TABLE bila belum ada, sehingga proses
+`update` (lihat install.sh) aman dijalankan tanpa menghapus database
+maupun riwayat chat yang sudah ada.
 """
 
 import sqlite3
@@ -19,7 +31,12 @@ logger = logging.getLogger("ai-bot.database")
 
 DB_PATH = "bot_data.db"
 
-DEFAULT_DAILY_LIMIT = 20
+# Kuota token harian default untuk user baru (di-reset tiap 24 jam / ganti hari UTC)
+DEFAULT_DAILY_TOKEN_LIMIT = 50_000
+
+# Tier model default untuk user baru
+DEFAULT_MODEL_TIER = "medium"
+VALID_MODEL_TIERS = ("light", "medium", "heavy")
 
 
 def set_db_path(path: str) -> None:
@@ -44,8 +61,42 @@ def get_db():
         conn.close()
 
 
+def _existing_columns(conn: sqlite3.Connection, table: str) -> set:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {row["name"] for row in rows}
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """
+    Menambahkan kolom baru ke tabel yang sudah ada (dari instalasi versi lama)
+    tanpa menghapus data. Aman dipanggil berulang kali (idempotent) — setiap
+    kolom hanya ditambahkan jika belum ada.
+    """
+    # --- users: kolom sistem token + model tier ---
+    user_cols = _existing_columns(conn, "users")
+    if "model_tier" not in user_cols:
+        conn.execute(
+            f"ALTER TABLE users ADD COLUMN model_tier TEXT NOT NULL DEFAULT '{DEFAULT_MODEL_TIER}'"
+        )
+        logger.info("Migrasi DB: kolom 'model_tier' ditambahkan ke tabel users.")
+    if "token_limit" not in user_cols:
+        conn.execute(
+            f"ALTER TABLE users ADD COLUMN token_limit INTEGER NOT NULL DEFAULT {DEFAULT_DAILY_TOKEN_LIMIT}"
+        )
+        logger.info("Migrasi DB: kolom 'token_limit' ditambahkan ke tabel users.")
+    if "tokens_used" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN tokens_used INTEGER NOT NULL DEFAULT 0")
+        logger.info("Migrasi DB: kolom 'tokens_used' ditambahkan ke tabel users.")
+
+    # --- redeem_codes: kolom token_value (pengganti limit_value / chat-based) ---
+    code_cols = _existing_columns(conn, "redeem_codes")
+    if "token_value" not in code_cols:
+        conn.execute("ALTER TABLE redeem_codes ADD COLUMN token_value INTEGER NOT NULL DEFAULT 0")
+        logger.info("Migrasi DB: kolom 'token_value' ditambahkan ke tabel redeem_codes.")
+
+
 def init_db() -> None:
-    """Membuat semua tabel jika belum ada."""
+    """Membuat semua tabel jika belum ada, lalu menjalankan migrasi kolom baru jika perlu."""
     with get_db() as conn:
         conn.execute(
             """
@@ -61,15 +112,16 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_user_token ON chats(user_token);")
 
         conn.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_seen REAL NOT NULL,
-                daily_limit INTEGER NOT NULL DEFAULT 20,
+                model_tier TEXT NOT NULL DEFAULT '{DEFAULT_MODEL_TIER}',
+                token_limit INTEGER NOT NULL DEFAULT {DEFAULT_DAILY_TOKEN_LIMIT},
+                tokens_used INTEGER NOT NULL DEFAULT 0,
                 is_unlimited INTEGER NOT NULL DEFAULT 0,
                 plan_expires_at REAL,
-                chats_used_today INTEGER NOT NULL DEFAULT 0,
                 usage_date TEXT NOT NULL,
                 is_banned INTEGER NOT NULL DEFAULT 0
             );
@@ -80,7 +132,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS redeem_codes (
                 code TEXT PRIMARY KEY,
-                limit_value INTEGER NOT NULL,
+                token_value INTEGER NOT NULL DEFAULT 0,
                 is_unlimited INTEGER NOT NULL DEFAULT 0,
                 duration_days INTEGER NOT NULL,
                 created_by INTEGER NOT NULL,
@@ -90,6 +142,10 @@ def init_db() -> None:
             );
             """
         )
+
+        # Migrasi kolom baru untuk database yang dibuat oleh versi sebelumnya
+        _migrate_schema(conn)
+
     logger.info("Database siap: %s", DB_PATH)
 
 
@@ -133,7 +189,7 @@ def clear_history(user_token: str) -> None:
 
 
 # =========================================================================
-# USERS & LIMIT HARIAN
+# USERS & KUOTA TOKEN HARIAN
 # =========================================================================
 
 def _today_str() -> str:
@@ -152,11 +208,11 @@ def get_or_create_user(telegram_id: int, username: Optional[str]) -> Dict[str, A
             conn.execute(
                 """
                 INSERT INTO users
-                    (telegram_id, username, first_seen, daily_limit, is_unlimited,
-                     plan_expires_at, chats_used_today, usage_date, is_banned)
-                VALUES (?, ?, ?, ?, 0, NULL, 0, ?, 0)
+                    (telegram_id, username, first_seen, model_tier, token_limit, tokens_used,
+                     is_unlimited, plan_expires_at, usage_date, is_banned)
+                VALUES (?, ?, ?, ?, ?, 0, 0, NULL, ?, 0)
                 """,
-                (telegram_id, username, time.time(), DEFAULT_DAILY_LIMIT, today),
+                (telegram_id, username, time.time(), DEFAULT_MODEL_TIER, DEFAULT_DAILY_TOKEN_LIMIT, today),
             )
             row = conn.execute(
                 "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
@@ -172,45 +228,59 @@ def get_or_create_user(telegram_id: int, username: Optional[str]) -> Dict[str, A
             )
             user["username"] = username
 
-        # Reset counter harian jika tanggal sudah berganti
+        # Reset kuota token harian jika tanggal sudah berganti
         if user["usage_date"] != today:
             conn.execute(
-                "UPDATE users SET chats_used_today = 0, usage_date = ? WHERE telegram_id = ?",
+                "UPDATE users SET tokens_used = 0, usage_date = ? WHERE telegram_id = ?",
                 (today, telegram_id),
             )
-            user["chats_used_today"] = 0
+            user["tokens_used"] = 0
             user["usage_date"] = today
 
-        # Jika plan berbayar (limit tinggi/unlimited) sudah kedaluwarsa, turunkan kembali ke default
+        # Jika plan berbayar (kuota tinggi/unlimited) sudah kedaluwarsa, turunkan kembali ke default
         if user["plan_expires_at"] is not None and time.time() > user["plan_expires_at"]:
             conn.execute(
                 """
                 UPDATE users
-                SET daily_limit = ?, is_unlimited = 0, plan_expires_at = NULL
+                SET token_limit = ?, is_unlimited = 0, plan_expires_at = NULL
                 WHERE telegram_id = ?
                 """,
-                (DEFAULT_DAILY_LIMIT, telegram_id),
+                (DEFAULT_DAILY_TOKEN_LIMIT, telegram_id),
             )
-            user["daily_limit"] = DEFAULT_DAILY_LIMIT
+            user["token_limit"] = DEFAULT_DAILY_TOKEN_LIMIT
             user["is_unlimited"] = 0
             user["plan_expires_at"] = None
 
     return user
 
 
-def can_chat(user: Dict[str, Any]) -> bool:
+def can_use(user: Dict[str, Any]) -> bool:
+    """Mengecek apakah user masih boleh memakai bot (belum diban & kuota token masih ada)."""
     if user["is_banned"]:
         return False
     if user["is_unlimited"]:
         return True
-    return user["chats_used_today"] < user["daily_limit"]
+    return user["tokens_used"] < user["token_limit"]
 
 
-def increment_usage(telegram_id: int) -> None:
+def add_token_usage(telegram_id: int, tokens_to_deduct: int) -> None:
+    """Menambah pemakaian token user (sudah dikalikan multiplier tier model oleh pemanggil)."""
+    if tokens_to_deduct <= 0:
+        return
     with get_db() as conn:
         conn.execute(
-            "UPDATE users SET chats_used_today = chats_used_today + 1 WHERE telegram_id = ?",
-            (telegram_id,),
+            "UPDATE users SET tokens_used = tokens_used + ? WHERE telegram_id = ?",
+            (tokens_to_deduct, telegram_id),
+        )
+
+
+def set_model_tier(telegram_id: int, tier: str) -> None:
+    if tier not in VALID_MODEL_TIERS:
+        raise ValueError(f"Tier model tidak valid: {tier}")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE users SET model_tier = ? WHERE telegram_id = ?",
+            (tier, telegram_id),
         )
 
 
@@ -222,9 +292,10 @@ def get_user(telegram_id: int) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def apply_plan(telegram_id: int, limit_value: int, is_unlimited: bool, duration_days: int) -> None:
+def apply_plan(telegram_id: int, token_value: int, is_unlimited: bool, duration_days: int) -> None:
     """
-    Menerapkan hasil redeem code ke akun user: limit baru + masa berlaku baru (hari ini + duration_days).
+    Menerapkan hasil redeem code ke akun user: kuota token baru + masa berlaku baru
+    (hari ini + duration_days), dan reset pemakaian token hari ini ke 0.
     Mengasumsikan user sudah ada (panggil get_or_create_user terlebih dahulu) — jika tidak,
     raise error secara eksplisit alih-alih diam-diam tidak melakukan apa pun.
     """
@@ -233,10 +304,10 @@ def apply_plan(telegram_id: int, limit_value: int, is_unlimited: bool, duration_
         cursor = conn.execute(
             """
             UPDATE users
-            SET daily_limit = ?, is_unlimited = ?, plan_expires_at = ?
+            SET token_limit = ?, is_unlimited = ?, plan_expires_at = ?, tokens_used = 0
             WHERE telegram_id = ?
             """,
-            (limit_value, 1 if is_unlimited else 0, expires_at, telegram_id),
+            (token_value, 1 if is_unlimited else 0, expires_at, telegram_id),
         )
         if cursor.rowcount == 0:
             raise ValueError(
@@ -268,7 +339,7 @@ def count_users() -> int:
 
 
 # =========================================================================
-# REDEEM CODES
+# REDEEM CODES (BERBASIS TOKEN)
 # =========================================================================
 
 def _generate_code(length: int = 10) -> str:
@@ -277,9 +348,9 @@ def _generate_code(length: int = 10) -> str:
 
 
 def create_redeem_code(
-    limit_value: int, is_unlimited: bool, duration_days: int, created_by: int
+    token_value: int, is_unlimited: bool, duration_days: int, created_by: int
 ) -> str:
-    """Membuat kode redeem baru yang unik dan menyimpannya ke database."""
+    """Membuat kode redeem baru (kuota token) yang unik dan menyimpannya ke database."""
     with get_db() as conn:
         for _ in range(10):  # coba beberapa kali jika terjadi tabrakan kode (sangat jarang)
             code = _generate_code()
@@ -291,10 +362,10 @@ def create_redeem_code(
             conn.execute(
                 """
                 INSERT INTO redeem_codes
-                    (code, limit_value, is_unlimited, duration_days, created_by, created_at)
+                    (code, token_value, is_unlimited, duration_days, created_by, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (code, limit_value, 1 if is_unlimited else 0, duration_days, created_by, time.time()),
+                (code, token_value, 1 if is_unlimited else 0, duration_days, created_by, time.time()),
             )
             return code
     raise RuntimeError("Gagal membuat kode redeem unik setelah beberapa percobaan.")
