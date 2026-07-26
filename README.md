@@ -22,7 +22,7 @@ mendapat kuota token harian, dengan sistem kode redeem untuk menaikkan kuota
      saja, ID kamu akan ditampilkan)
 4. Di VPS Ubuntu, jalankan:
    ```
-   curl -sL https://raw.githubusercontent.com/<user>/<repo>/main/install.sh | sudo bash
+   curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/install.sh | sudo bash
    ```
 5. Installer akan meminta Token Bot dan ID Owner di tengah proses instalasi, lalu
    otomatis menyimpannya ke `/opt/ai-bot/.env` (chmod 600) — TIDAK ADA di source code.
