@@ -266,6 +266,11 @@ github_auto_setup() {
   if [[ ! -d "${APP_DIR}/.git" ]]; then
     git -C "${APP_DIR}" init -q
   fi
+  # Identitas commit lokal ke repo ini (bukan --global) supaya auto-backup di bot.py
+  # tetap bisa commit walau dijalankan sebagai service user (mis. 'aibot') yang tidak
+  # punya home directory / git config global sendiri.
+  git -C "${APP_DIR}" config user.name "BimXYZ Auto Backup"
+  git -C "${APP_DIR}" config user.email "auto-backup@bimxyz.local"
   if git -C "${APP_DIR}" remote get-url db-backup &>/dev/null; then
     git -C "${APP_DIR}" remote set-url db-backup "${GH_REMOTE_URL}"
   else
