@@ -31,6 +31,10 @@ SERVICE_NAME="ai-bot"
 SERVICE_USER="aibot"
 ENV_FILE="${APP_DIR}/.env"
 
+# --- GitHub Backup & Restore (otomatis, hanya butuh PAT) ---
+GH_BACKUP_REPO_NAME="ai-bot-db-backup"
+DB_FILE_NAME="bot_data.db"
+
 # --- Sistem 3 Tier Model ---
 OLLAMA_MODEL_LIGHT="qwen2.5-coder:1.5b"
 OLLAMA_MODEL_MEDIUM="qwen2.5-coder:7b"
@@ -182,6 +186,98 @@ print('Migrasi database selesai (kuota token per-user, model_tier, redeem token_
   echo ""
 }
 
+github_auto_setup() {
+  # Input hanya PAT. Username & repo di-auto-detect/auto-create via GitHub API.
+  echo -e "${BOLD}=================================================================${NC}"
+  echo -e "${BOLD}   GITHUB BACKUP & RESTORE DATABASE (OTOMATIS)${NC}"
+  echo -e "${BOLD}=================================================================${NC}"
+  echo ""
+  echo -e "${YELLOW}⚠️ MASUKKAN GITHUB PERSONAL ACCESS TOKEN (PAT) ⚠️${NC}"
+  echo -e "Rekomendasi: Gunakan Fine-grained PAT dengan akses"
+  echo -e "\"Repository permissions\" -> \"Contents\" -> \"Read and write\"."
+  echo -e "--------------------------------------------------"
+  read -r -p "GitHub PAT (kosongkan untuk skip fitur backup): " GH_PAT_INPUT < "${TTY_IN}"
+  echo ""
+
+  if [[ -z "${GH_PAT_INPUT// }" ]]; then
+    log_warn "PAT kosong, fitur GitHub backup/restore dilewati (bisa disetel lagi lewat menu Update)."
+    return 0
+  fi
+
+  log_info "Memverifikasi PAT & mendeteksi username GitHub..."
+  GH_USER_JSON="$(curl -sf -H "Authorization: Bearer ${GH_PAT_INPUT}" -H "Accept: application/vnd.github+json" https://api.github.com/user || true)"
+  GH_USERNAME="$(echo "${GH_USER_JSON}" | grep -o '"login"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
+
+  if [[ -z "${GH_USERNAME}" ]]; then
+    log_error "PAT tidak valid / gagal menghubungi GitHub API. Fitur backup/restore dilewati."
+    return 0
+  fi
+  log_success "Terautentikasi sebagai GitHub user: ${GH_USERNAME}"
+
+  log_info "Mengecek apakah repo ${GH_USERNAME}/${GH_BACKUP_REPO_NAME} sudah ada..."
+  REPO_CHECK_STATUS="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${GH_PAT_INPUT}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GH_USERNAME}/${GH_BACKUP_REPO_NAME}")"
+
+  if [[ "${REPO_CHECK_STATUS}" == "200" ]]; then
+    log_success "Repo backup sudah ada, akan dipakai ulang."
+  else
+    log_info "Repo belum ada, membuat repo private '${GH_BACKUP_REPO_NAME}' otomatis..."
+    CREATE_STATUS="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+      -H "Authorization: Bearer ${GH_PAT_INPUT}" -H "Accept: application/vnd.github+json" \
+      https://api.github.com/user/repos \
+      -d "{\"name\":\"${GH_BACKUP_REPO_NAME}\",\"private\":true,\"auto_init\":true}")"
+    if [[ "${CREATE_STATUS}" == "201" ]]; then
+      log_success "Repo private ${GH_BACKUP_REPO_NAME} berhasil dibuat."
+      sleep 2
+    else
+      log_error "Gagal membuat repo (HTTP ${CREATE_STATUS}). Fitur backup/restore dilewati."
+      return 0
+    fi
+  fi
+
+  GH_REMOTE_URL="https://${GH_PAT_INPUT}@github.com/${GH_USERNAME}/${GH_BACKUP_REPO_NAME}.git"
+
+  log_info "Menyiapkan git remote 'db-backup' di ${APP_DIR}..."
+  git config --global --add safe.directory "${APP_DIR}" || true
+  if [[ ! -d "${APP_DIR}/.git" ]]; then
+    git -C "${APP_DIR}" init -q
+  fi
+  if git -C "${APP_DIR}" remote get-url db-backup &>/dev/null; then
+    git -C "${APP_DIR}" remote set-url db-backup "${GH_REMOTE_URL}"
+  else
+    git -C "${APP_DIR}" remote add db-backup "${GH_REMOTE_URL}"
+  fi
+
+  log_info "Mengecek apakah ada database.db lama di remote backup untuk di-restore..."
+  TMP_RESTORE="$(mktemp -d)"
+  if git clone -q --depth 1 "${GH_REMOTE_URL}" "${TMP_RESTORE}" 2>/dev/null; then
+    if [[ -f "${TMP_RESTORE}/${DB_FILE_NAME}" ]]; then
+      cp -f "${TMP_RESTORE}/${DB_FILE_NAME}" "${APP_DIR}/${DB_FILE_NAME}"
+      log_success "Database lama ditemukan di GitHub, berhasil di-restore ke ${APP_DIR}/${DB_FILE_NAME}."
+    else
+      log_warn "Repo backup ada tapi belum ada ${DB_FILE_NAME} di dalamnya (kemungkinan install pertama kali)."
+    fi
+  else
+    log_warn "Belum bisa clone repo backup (repo kosong/baru). Backup pertama akan dibuat otomatis oleh bot."
+  fi
+  rm -rf "${TMP_RESTORE}"
+
+  GH_BACKUP_ENABLED="true"
+
+  # Tulis/perbarui baris GH_BACKUP_* di .env jika file sudah ada (mode Update);
+  # untuk fresh install, baris ini juga ditulis ulang oleh blok cat > .env utama.
+  if [[ -f "${ENV_FILE}" ]]; then
+    umask 077
+    sed -i '/^GH_BACKUP_ENABLED=/d;/^GH_BACKUP_PAT=/d;/^GH_BACKUP_REPO=/d' "${ENV_FILE}"
+    {
+      echo "GH_BACKUP_ENABLED=true"
+      echo "GH_BACKUP_PAT=${GH_PAT_INPUT}"
+      echo "GH_BACKUP_REPO=${GH_USERNAME}/${GH_BACKUP_REPO_NAME}"
+    } >> "${ENV_FILE}"
+    chmod 600 "${ENV_FILE}"
+  fi
+  echo ""
+}
+
 setup_systemd_service() {
   log_info "Membuat/memperbarui systemd service '${SERVICE_NAME}'..."
 
@@ -295,6 +391,13 @@ print_footer() {
   echo -e "   Config rahasia      : ${GREEN}${ENV_FILE}${NC}"
   echo -e "   Service systemd     : ${GREEN}/etc/systemd/system/${SERVICE_NAME}.service${NC}"
   echo ""
+  if grep -q '^GH_BACKUP_ENABLED=true' "${ENV_FILE}" 2>/dev/null; then
+    GH_REPO_DISPLAY="$(grep '^GH_BACKUP_REPO=' "${ENV_FILE}" | cut -d= -f2)"
+    echo -e "${BLUE}${BOLD}   BACKUP OTOMATIS DATABASE KE GITHUB${NC}"
+    echo -e "   Status   : ${GREEN}AKTIF${NC} (auto-push tiap 60 detik jika ada perubahan)"
+    echo -e "   Repo     : ${GREEN}https://github.com/${GH_REPO_DISPLAY}${NC} (private)"
+    echo ""
+  fi
   echo -e "${BLUE}${BOLD}8. CARA UPDATE DI MASA DEPAN${NC}"
   echo -e "   Jalankan ulang installer ini dan pilih menu ${GREEN}[2] Update${NC}."
   echo -e "   Proses ini akan: git pull, update dependency Python, migrasi kolom DB baru"
@@ -347,6 +450,14 @@ run_update_flow() {
   echo ""
 
   setup_python_venv
+
+  if ! grep -q '^GH_BACKUP_ENABLED=true' "${ENV_FILE}" 2>/dev/null; then
+    log_info "Fitur GitHub backup/restore belum dikonfigurasi. Setup sekarang (opsional)..."
+    github_auto_setup
+    chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
+    chmod 600 "${ENV_FILE}"
+  fi
+
   migrate_database
   pull_all_models
 
@@ -442,6 +553,9 @@ run_fresh_install_flow() {
 # Tambahkan "*.env" ke .gitignore repo Anda.
 TELEGRAM_BOT_TOKEN=${BOT_TOKEN_INPUT}
 OWNER_TELEGRAM_ID=${OWNER_ID_INPUT}
+GH_BACKUP_ENABLED=${GH_BACKUP_ENABLED:-false}
+GH_BACKUP_PAT=${GH_PAT_INPUT:-}
+GH_BACKUP_REPO=${GH_USERNAME:-}/${GH_BACKUP_REPO_NAME}
 EOF
   chmod 600 "${ENV_FILE}"
   log_success "Konfigurasi bot berhasil disimpan secara aman (chmod 600, tidak ada di source code)."
@@ -449,6 +563,9 @@ EOF
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
   chmod 600 "${ENV_FILE}"
   echo ""
+
+  github_auto_setup
+  chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
 
   migrate_database
 

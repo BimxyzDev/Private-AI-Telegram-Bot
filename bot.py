@@ -27,9 +27,13 @@ Jalankan dengan:
 
 import os
 import io
+import re
 import asyncio
+import hashlib
 import logging
 import html
+import subprocess
+import tempfile
 import traceback
 from typing import Optional
 
@@ -73,6 +77,15 @@ except ValueError:
 
 DB_PATH = os.environ.get("AI_BOT_DB_PATH", "bot_data.db")
 db.set_db_path(DB_PATH)
+
+# --- GitHub Backup & Restore (otomatis, dikonfigurasi lewat install.sh) ---
+GH_BACKUP_ENABLED = os.environ.get("GH_BACKUP_ENABLED", "false").lower() == "true"
+GH_BACKUP_PAT = os.environ.get("GH_BACKUP_PAT", "")
+GH_BACKUP_INTERVAL_SEC = 60
+_APP_DIR = os.path.dirname(os.path.abspath(DB_PATH)) or "."
+_DB_BASENAME = os.path.basename(DB_PATH)
+
+PIN_TAG_RE = re.compile(r"\[PIN\]", re.IGNORECASE)
 
 MAX_TELEGRAM_FILE_MB = 50  # batas file yang bisa diunduh bot lewat Bot API (server lokal bisa lebih besar)
 MAX_TELEGRAM_MSG_LEN = 4000  # sedikit di bawah batas Telegram 4096 agar ada ruang untuk formatting
@@ -190,6 +203,68 @@ async def send_long_message(update: Update, text: str) -> None:
         await update.effective_message.reply_text(chunk)
 
 
+AUTO_FILE_THRESHOLD = 3000
+
+# Ekstensi bahasa fenced-code-block -> ekstensi file yang dikirim sebagai Document
+CODE_LANG_EXT = {
+    "python": "py", "py": "py", "javascript": "js", "js": "js", "typescript": "ts",
+    "ts": "ts", "jsx": "jsx", "tsx": "tsx", "html": "html", "css": "css", "json": "json",
+    "bash": "sh", "sh": "sh", "shell": "sh", "yaml": "yaml", "yml": "yaml", "sql": "sql",
+    "java": "java", "c": "c", "cpp": "cpp", "go": "go", "rust": "rs", "php": "php",
+    "xml": "xml", "markdown": "md", "md": "md",
+}
+FIRST_FENCE_RE = re.compile(r"```([a-zA-Z0-9_+-]*)\n")
+
+
+def _guess_file_extension(text: str) -> str:
+    m = FIRST_FENCE_RE.search(text)
+    if m:
+        lang = m.group(1).lower()
+        if lang in CODE_LANG_EXT:
+            return CODE_LANG_EXT[lang]
+    return "txt"
+
+
+async def _send_as_document(update: Update, text: str, caption: str) -> None:
+    ext = _guess_file_extension(text)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=f".{ext}", delete=False, encoding="utf-8") as tmp:
+        tmp.write(text)
+        tmp_path = tmp.name
+    try:
+        with open(tmp_path, "rb") as f:
+            await update.effective_message.reply_document(
+                document=f, filename=f"jawaban.{ext}", caption=caption[:1000]
+            )
+    finally:
+        os.remove(tmp_path)
+
+
+async def deliver_ai_reply(update: Update, reply_text: str) -> None:
+    """
+    Menangani fleksibilitas respons AI:
+      - Deteksi tag [PIN] -> hapus tag, kirim, lalu pin pesan tersebut.
+      - Jika teks > 3000 karakter -> kirim sebagai file Document, bukan dipecah jadi banyak pesan.
+      - Selain itu -> kirim sebagai pesan teks biasa (dipecah otomatis jika perlu).
+    """
+    should_pin = bool(PIN_TAG_RE.search(reply_text))
+    clean_text = PIN_TAG_RE.sub("", reply_text).strip() or "[Jawaban kosong]"
+
+    if len(clean_text) > AUTO_FILE_THRESHOLD:
+        preview = clean_text[:200].strip()
+        await _send_as_document(update, clean_text, caption=f"📄 Jawaban lengkap (teks panjang)\n{preview}...")
+        sent_message = update.effective_message
+    else:
+        for i in range(0, len(clean_text), MAX_TELEGRAM_MSG_LEN):
+            chunk = clean_text[i : i + MAX_TELEGRAM_MSG_LEN]
+            sent_message = await update.effective_message.reply_text(chunk)
+
+    if should_pin:
+        try:
+            await sent_message.pin(disable_notification=True)
+        except TelegramError as e:
+            logger.warning("Gagal pin pesan: %s", e)
+
+
 def format_time_remaining(expires_at: Optional[float]) -> str:
     if expires_at is None:
         return "-"
@@ -214,6 +289,75 @@ def escape_markdown_v1(text: str) -> str:
     for ch in ("_", "*", "`", "["):
         text = text.replace(ch, f"\\{ch}")
     return text
+
+
+# =========================================================================
+# BACKGROUND TASK: AUTO-BACKUP database.db KE GITHUB TIAP 60 DETIK
+# =========================================================================
+
+def _file_hash(path: str) -> Optional[str]:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _run_git(args: list, cwd: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=60
+    )
+
+
+def _git_push_db_sync() -> None:
+    """Jalan di thread terpisah (blocking OK di sini): commit + push database.db ke remote db-backup."""
+    import time as _time
+
+    if not os.path.isdir(os.path.join(_APP_DIR, ".git")):
+        logger.warning("GH backup: %s bukan git repo, skip push.", _APP_DIR)
+        return
+
+    _run_git(["add", _DB_BASENAME], cwd=_APP_DIR)
+    commit_msg = f"Auto-backup DB: {_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    commit_result = _run_git(["commit", "-m", commit_msg], cwd=_APP_DIR)
+    if commit_result.returncode != 0 and "nothing to commit" not in commit_result.stdout.lower():
+        logger.warning("GH backup: git commit gagal: %s", commit_result.stderr.strip())
+        return
+
+    for branch in ("main", "master"):
+        push_result = _run_git(["push", "db-backup", f"HEAD:{branch}"], cwd=_APP_DIR)
+        if push_result.returncode == 0:
+            logger.info("GH backup: database.db berhasil di-push ke branch %s.", branch)
+            return
+    logger.warning("GH backup: git push gagal ke main maupun master.")
+
+
+async def github_auto_backup_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Loop background: cek hash database.db tiap 60 detik, push ke GitHub hanya jika berubah."""
+    last_hash: Optional[str] = None
+    while True:
+        await asyncio.sleep(GH_BACKUP_INTERVAL_SEC)
+        try:
+            current_hash = _file_hash(DB_PATH)
+            if current_hash is None:
+                continue
+            if current_hash == last_hash:
+                continue  # tidak ada perubahan, skip push demi hemat CPU/bandwidth
+            await asyncio.to_thread(_git_push_db_sync)
+            last_hash = current_hash
+        except Exception:
+            logger.exception("GH backup: error tak terduga di loop auto-backup")
+
+
+async def _post_init_start_backup(application: Application) -> None:
+    if not (GH_BACKUP_ENABLED and GH_BACKUP_PAT):
+        logger.info("GH backup: dinonaktifkan (GH_BACKUP_ENABLED != true atau PAT kosong).")
+        return
+    application.create_task(github_auto_backup_loop(application))
+    logger.info("GH backup: auto-backup database.db tiap %ss AKTIF.", GH_BACKUP_INTERVAL_SEC)
 
 
 # =========================================================================
@@ -622,7 +766,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         db.save_message(token, "assistant", reply_text)
         _deduct_tokens_for_tier(telegram_user.id, tier, result["total_tokens"])
 
-        await send_long_message(update, reply_text)
+        await deliver_ai_reply(update, reply_text)
     except engine.AIEngineError as e:
         logger.error("AIEngineError saat chat: %s", e)
         await message.reply_text(f"❌ {e.user_message}")
@@ -699,7 +843,7 @@ async def _process_and_reply_file(
         if result["truncated"]:
             await message.reply_text("ℹ️ Catatan: hasil ekstraksi file terpotong karena terlalu panjang.")
 
-        await send_long_message(update, reply_text)
+        await deliver_ai_reply(update, reply_text)
     except engine.AIEngineError as e:
         logger.error("AIEngineError saat memproses file: %s", e)
         await message.reply_text(f"❌ {e.user_message}")
@@ -795,6 +939,7 @@ def main() -> None:
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(8)
+        .post_init(_post_init_start_backup)
         .build()
     )
 
