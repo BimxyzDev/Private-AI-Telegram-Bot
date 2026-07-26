@@ -224,16 +224,40 @@ github_auto_setup() {
     return 0
   fi
 
-  # Ambil nama repo pertama dari respons JSON (field "name" milik object repo, bukan owner/dsb).
-  GH_DETECTED_REPO="$(echo "${REPOS_BODY}" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
+  # Nama repo source code bot ini sendiri (dari REPO_GIT_URL) -> JANGAN pernah dipakai
+  # sebagai remote backup, walaupun PAT punya akses ke situ juga.
+  SELF_REPO_NAME="$(basename "${REPO_GIT_URL}" .git)"
 
-  if [[ -z "${GH_DETECTED_REPO}" ]]; then
-    log_error "PAT ini tidak punya akses ke repo manapun (daftar repo kosong)."
-    log_error "Pastikan Fine-grained PAT di-scope ke minimal 1 repo dengan permission Contents: Read and write."
+  # Ambil SEMUA nama repo (field "name" milik object repo) dari respons JSON, lalu buang duplikat.
+  mapfile -t ALL_REPOS < <(echo "${REPOS_BODY}" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]+)"$/\1/' | awk '!seen[$0]++')
+
+  # Buang repo source code bot dari daftar kandidat backup.
+  CANDIDATE_REPOS=()
+  for r in "${ALL_REPOS[@]}"; do
+    [[ "${r}" != "${SELF_REPO_NAME}" ]] && CANDIDATE_REPOS+=("${r}")
+  done
+
+  if [[ "${#CANDIDATE_REPOS[@]}" -eq 0 ]]; then
+    log_error "PAT ini hanya punya akses ke repo source code bot (${SELF_REPO_NAME}) atau tidak ada repo sama sekali."
+    log_error "Buat/scope PAT ke repo backup KHUSUS (terpisah dari repo source code bot)."
     log_error "Fitur backup/restore dilewati."
     return 0
+  elif [[ "${#CANDIDATE_REPOS[@]}" -eq 1 ]]; then
+    GH_DETECTED_REPO="${CANDIDATE_REPOS[0]}"
+    log_success "Repo terdeteksi: ${GH_USERNAME}/${GH_DETECTED_REPO} (akan dipakai sebagai remote backup)."
+  else
+    log_warn "PAT ini punya akses ke lebih dari 1 repo, pilih mana yang dipakai untuk backup database:"
+    for i in "${!CANDIDATE_REPOS[@]}"; do
+      echo -e "  ${GREEN}[$((i+1))]${NC} ${CANDIDATE_REPOS[$i]}"
+    done
+    read -r -p "Masukkan nomor repo [1-${#CANDIDATE_REPOS[@]}]: " REPO_CHOICE < "${TTY_IN}"
+    while ! [[ "${REPO_CHOICE}" =~ ^[0-9]+$ ]] || (( REPO_CHOICE < 1 || REPO_CHOICE > ${#CANDIDATE_REPOS[@]} )); do
+      log_warn "Pilihan tidak valid."
+      read -r -p "Masukkan nomor repo [1-${#CANDIDATE_REPOS[@]}]: " REPO_CHOICE < "${TTY_IN}"
+    done
+    GH_DETECTED_REPO="${CANDIDATE_REPOS[$((REPO_CHOICE-1))]}"
+    log_success "Repo dipilih: ${GH_USERNAME}/${GH_DETECTED_REPO}"
   fi
-  log_success "Repo terdeteksi: ${GH_USERNAME}/${GH_DETECTED_REPO} (akan dipakai sebagai remote backup)."
 
   GH_REMOTE_URL="https://${GH_PAT_INPUT}@github.com/${GH_USERNAME}/${GH_DETECTED_REPO}.git"
 
