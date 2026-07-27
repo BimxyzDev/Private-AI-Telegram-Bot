@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 
-# Private AI Telegram Bot - Installer / Updater (v2 - Sistem Token + 3 Tier Model)
+# Private AI Telegram Bot - Installer / Updater (v3 - Sistem Role General/Coder + Tier + Token)
 
 # Instalasi via:
 #   curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/install.sh | sudo bash
 #
 # Sistem target: Ubuntu 20.04/22.04/24.04, RAM 16GB+, CPU 8 Core+
-# Stack: Ollama (3 tier qwen2.5-coder + qwen2.5vl) + python-telegram-bot (polling) + Systemd
+# Stack: Ollama (5 model: 2 General Chat + 3 Coder/IT + qwen2.5vl vision) + python-telegram-bot (polling) + Systemd
 #
 # Bot berjalan mode POLLING (bukan webhook) sehingga TIDAK butuh domain,
 # TIDAK butuh SSL/certbot, dan TIDAK butuh Nginx. Bot cukup terhubung ke
@@ -34,12 +34,21 @@ ENV_FILE="${APP_DIR}/.env"
 # --- GitHub Backup & Restore (otomatis, hanya butuh PAT) ---
 DB_FILE_NAME="bot_data.db"
 
-# --- Sistem 3 Tier Model ---
-OLLAMA_MODEL_LIGHT="qwen2.5-coder:1.5b"
-OLLAMA_MODEL_MEDIUM="qwen2.5-coder:7b"
-OLLAMA_MODEL_HEAVY="qwen2.5-coder:14b"
+# --- Sistem Role + Tier Model (General Chat & Coder/IT) ---
+OLLAMA_MODEL_GENERAL_LIGHT="llama3.2:3b"
+OLLAMA_MODEL_GENERAL_MEDIUM="llama3.1:8b"
+OLLAMA_MODEL_CODER_LIGHT="qwen2.5-coder:1.5b"
+OLLAMA_MODEL_CODER_MEDIUM="qwen2.5-coder:7b"
+OLLAMA_MODEL_CODER_HEAVY="qwen2.5-coder:14b"
 OLLAMA_VISION_MODEL="qwen2.5vl"
-ALL_MODELS=("${OLLAMA_MODEL_LIGHT}" "${OLLAMA_MODEL_MEDIUM}" "${OLLAMA_MODEL_HEAVY}" "${OLLAMA_VISION_MODEL}")
+ALL_MODELS=(
+  "${OLLAMA_MODEL_GENERAL_LIGHT}"
+  "${OLLAMA_MODEL_GENERAL_MEDIUM}"
+  "${OLLAMA_MODEL_CODER_LIGHT}"
+  "${OLLAMA_MODEL_CODER_MEDIUM}"
+  "${OLLAMA_MODEL_CODER_HEAVY}"
+  "${OLLAMA_VISION_MODEL}"
+)
 
 # Rentang versi python-telegram-bot yang sudah diuji cocok dengan kode bot ini
 # (API modul telegram.ext & telegram.constants sejak v20 relatif stabil hingga v21.x).
@@ -175,7 +184,7 @@ sys.path.insert(0, '${APP_DIR}')
 import database as db
 db.set_db_path('${APP_DIR}/bot_data.db')
 db.init_db()
-print('Migrasi database selesai (kuota token per-user, model_tier, redeem token_value siap).')
+print('Migrasi database selesai (kuota token per-user, model_role + model_tier, redeem token_value siap).')
 "; then
     log_success "Migrasi database berhasil. Database & riwayat chat lama tetap aman/tidak terhapus."
   else
@@ -328,9 +337,11 @@ User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${APP_DIR}
 Environment="OLLAMA_HOST=http://127.0.0.1:11434"
-Environment="OLLAMA_MODEL_LIGHT=${OLLAMA_MODEL_LIGHT}"
-Environment="OLLAMA_MODEL_MEDIUM=${OLLAMA_MODEL_MEDIUM}"
-Environment="OLLAMA_MODEL_HEAVY=${OLLAMA_MODEL_HEAVY}"
+Environment="OLLAMA_MODEL_GENERAL_LIGHT=${OLLAMA_MODEL_GENERAL_LIGHT}"
+Environment="OLLAMA_MODEL_GENERAL_MEDIUM=${OLLAMA_MODEL_GENERAL_MEDIUM}"
+Environment="OLLAMA_MODEL_CODER_LIGHT=${OLLAMA_MODEL_CODER_LIGHT}"
+Environment="OLLAMA_MODEL_CODER_MEDIUM=${OLLAMA_MODEL_CODER_MEDIUM}"
+Environment="OLLAMA_MODEL_CODER_HEAVY=${OLLAMA_MODEL_CODER_HEAVY}"
 Environment="OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL}"
 Environment="OLLAMA_NUM_CTX=2048"
 Environment="AI_BOT_DB_PATH=${APP_DIR}/bot_data.db"
@@ -378,12 +389,16 @@ print_footer() {
   echo -e "   Buka Telegram, cari bot kamu, lalu kirim ${GREEN}/start${NC}."
   echo -e "   Bot berjalan mode POLLING — tidak butuh domain atau SSL."
   echo ""
-  echo -e "${BLUE}${BOLD}   SISTEM 3 TIER MODEL (/model)${NC}"
-  echo -e "   🟢 Light  : ${GREEN}${OLLAMA_MODEL_LIGHT}${NC}  (kuota token x1, super irit CPU)"
-  echo -e "   🟡 Medium : ${GREEN}${OLLAMA_MODEL_MEDIUM}${NC}    (kuota token x2, default)"
-  echo -e "   🔴 Heavy  : ${GREEN}${OLLAMA_MODEL_HEAVY}${NC}   (kuota token x3, reasoning maksimal)"
-  echo -e "   Vision    : ${GREEN}${OLLAMA_VISION_MODEL}${NC} (gambar & video, di luar sistem tier)"
-  echo -e "   User memilih tier lewat perintah ${YELLOW}/model${NC} di Telegram."
+  echo -e "${BLUE}${BOLD}   SISTEM ROLE + TIER MODEL (/model)${NC}"
+  echo -e "   🗣️  General Chat:"
+  echo -e "      🟢 Light  : ${GREEN}${OLLAMA_MODEL_GENERAL_LIGHT}${NC}  (kuota token x1, super irit CPU)"
+  echo -e "      🟡 Medium : ${GREEN}${OLLAMA_MODEL_GENERAL_MEDIUM}${NC}  (kuota token x2, default user baru)"
+  echo -e "   💻 Coder / IT:"
+  echo -e "      🟢 Light  : ${GREEN}${OLLAMA_MODEL_CODER_LIGHT}${NC}  (kuota token x1, super irit CPU)"
+  echo -e "      🟡 Medium : ${GREEN}${OLLAMA_MODEL_CODER_MEDIUM}${NC}    (kuota token x2)"
+  echo -e "      🔴 Heavy  : ${GREEN}${OLLAMA_MODEL_CODER_HEAVY}${NC}   (kuota token x3, reasoning maksimal)"
+  echo -e "   Vision    : ${GREEN}${OLLAMA_VISION_MODEL}${NC} (gambar & video, di luar sistem role/tier)"
+  echo -e "   User memilih role lalu tier lewat perintah ${YELLOW}/model${NC} di Telegram (2 langkah)."
   echo ""
   echo -e "${BLUE}${BOLD}2. KUOTA TOKEN HARIAN${NC}"
   echo -e "   Setiap user baru otomatis mendapat ${GREEN}50.000 token/hari${NC} (reset tiap 24 jam)."

@@ -1,9 +1,11 @@
 # Private AI Telegram Bot
 
-Bot Telegram AI privat (mode polling): chat/coding lewat 3 tier model
-(qwen2.5-coder 1.5b/7b/14b) + analisis gambar & video (qwen2.5vl). Setiap user
-mendapat kuota token harian, dengan sistem kode redeem untuk menaikkan kuota
-(termasuk unlimited) hingga masa berlaku tertentu.
+Bot Telegram AI privat (mode polling): obrolan umum & coding lewat sistem Role +
+Tier model (🗣️ General Chat: llama3.2:3b/llama3.1:8b, 💻 Coder/IT: qwen2.5-coder
+1.5b/7b/14b) + analisis gambar & video (qwen2.5vl). Setiap user mendapat kuota
+token harian, dengan sistem kode redeem untuk menaikkan kuota (termasuk unlimited)
+hingga masa berlaku tertentu. Dilengkapi proteksi anti-jailbreak bawaan untuk
+menjaga model tetap pada persona & aturannya.
 
 ## Isi Paket
 - `bot.py`            — Bot Telegram utama (polling, python-telegram-bot)
@@ -36,10 +38,17 @@ cukup koneksi internet keluar dari VPS ke server Telegram.
 - Setiap user baru otomatis mendapat **50.000 token/hari** (reset otomatis tiap
   ganti hari UTC). Token terpakai dihitung dari jumlah token asli Ollama
   (prompt + hasil jawaban) dikali multiplier tier model yang dipakai.
-- User memilih tier model AI lewat `/model`:
-  - 🟢 **Light** (`qwen2.5-coder:1.5b`) — kuota token x1, paling irit
-  - 🟡 **Medium** (`qwen2.5-coder:7b`) — kuota token x2, default
-  - 🔴 **Heavy** (`qwen2.5-coder:14b`) — kuota token x3, reasoning maksimal
+- User memilih **Role** lalu **Tier** model AI lewat `/model` (2 langkah, Inline
+  Keyboard Telegram):
+  - 🗣️ **General Chat** — untuk obrolan santai, tanya umum, curhat, dll:
+    - 🟢 Light (`llama3.2:3b`) — kuota token x1, paling irit
+    - 🟡 Medium (`llama3.1:8b`) — kuota token x2, **default user baru**
+  - 💻 **Coder / IT** — untuk ngoding, debugging, pertanyaan teknis:
+    - 🟢 Light (`qwen2.5-coder:1.5b`) — kuota token x1, paling irit
+    - 🟡 Medium (`qwen2.5-coder:7b`) — kuota token x2
+    - 🔴 Heavy (`qwen2.5-coder:14b`) — kuota token x3, reasoning maksimal
+  - User bisa ganti role/tier kapan saja lewat `/model`, tanpa kehilangan riwayat
+    chat maupun kuota token yang tersisa.
 - Owner bisa membuat kode redeem lewat command di Telegram:
   ```
   /gencode <jumlah_token> <hari>   contoh: /gencode 100000 30
@@ -60,8 +69,8 @@ cukup koneksi internet keluar dari VPS ke server Telegram.
 | Command | Fungsi |
 |---|---|
 | `/start`, `/help` | Info & daftar perintah |
-| `/status` | Lihat sisa kuota token hari ini & tier model aktif |
-| `/model` | Pilih tier model AI (Light/Medium/Heavy) |
+| `/status` | Lihat sisa kuota token hari ini & role+tier model aktif |
+| `/model` | Pilih Role (General Chat/Coder-IT) lalu Tier model AI |
 | `/redeem <kode>` | Tukar kode redeem untuk menaikkan kuota token |
 | `/reset` | Hapus riwayat chat (mulai percakapan baru) |
 
@@ -90,6 +99,39 @@ Kirim file langsung ke bot (sebagai dokumen, foto, atau video Telegram):
 
 Batas upload per file: **50 MB**. Setiap file yang diproses tetap dihitung sebagai
 pemakaian kuota token harian (sesuai jumlah token hasil pemrosesan x multiplier tier model).
+
+## Proteksi Anti-Jailbreak
+
+Model kecil (1.5b–8b) yang dipakai di tier Light/Medium relatif lebih mudah
+"dibujuk" keluar dari aturan/persona-nya dibanding model besar. Bot ini punya
+2 lapis proteksi:
+
+1. **Pengecekan pola lokal** (di kode Python, sebelum request dikirim ke Ollama) —
+   mendeteksi pola umum jailbreak (misal "ignore all previous instructions",
+   "abaikan instruksi sebelumnya", "developer mode activated", dll). Jika
+   terdeteksi, bot langsung membalas penolakan tanpa memanggil model sama
+   sekali — **tidak memotong kuota token user**.
+2. **System prompt yang diperkuat** — setiap request ke Ollama selalu menyertakan
+   instruksi keamanan tetap yang tidak bisa dioverride lewat env var maupun
+   pesan dari user manapun (termasuk yang mengaku developer/owner/admin).
+
+Kedua lapis ini berlaku untuk **kedua role** (General Chat maupun Coder/IT).
+
+## Migrasi dari Versi Sebelumnya (3-Tier Coder-Only)
+
+Kalau kamu sudah punya bot ini berjalan dari versi sebelum sistem Role (yang
+cuma punya tier Light/Medium/Heavy berbasis qwen2.5-coder saja), migrasi
+database berjalan **otomatis dan aman**:
+
+- Kolom baru `model_role` ditambahkan lewat `ALTER TABLE`, database & riwayat
+  chat lama **tidak dihapus**.
+- User yang sudah ada di-backfill ke `model_role = 'coder'` secara otomatis,
+  sehingga **model yang mereka pakai tetap sama persis** seperti sebelum update
+  (tidak ada yang tiba-tiba pindah ke model General tanpa sepengetahuan mereka).
+- Hanya user **baru** (belum pernah chat sebelumnya) yang mendapat default baru
+  (General Chat, tier Medium → `llama3.1:8b`).
+- Cukup jalankan ulang `install.sh` (mode Update) di server yang sudah ada,
+  migrasi kolom akan otomatis dijalankan sebelum service di-restart.
 
 ## Backup Database ke GitHub (Opsional)
 

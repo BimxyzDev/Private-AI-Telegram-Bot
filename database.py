@@ -34,8 +34,16 @@ DB_PATH = "bot_data.db"
 # Kuota token harian default untuk user baru (di-reset tiap 24 jam / ganti hari UTC)
 DEFAULT_DAILY_TOKEN_LIMIT = 50_000
 
-# Tier model default untuk user baru
+# Role + tier default untuk user baru. Role menentukan "kategori" (general chat vs
+# coder/IT), tier menentukan ukuran model di dalam role tsb. Kombinasi ini HARUS
+# selalu valid terhadap ai_engine.ROLE_TIERS (general/medium -> llama3.1:8b).
+DEFAULT_MODEL_ROLE = "general"
 DEFAULT_MODEL_TIER = "medium"
+VALID_MODEL_ROLES = ("general", "coder")
+# Catatan: validasi apakah kombinasi role+tier benar-benar ada dilakukan di
+# ai_engine.resolve_model (fallback otomatis), bukan di sini -- supaya database
+# tidak perlu tahu daftar tier yang valid untuk tiap role (single source of truth
+# ada di ai_engine.ROLE_TIERS).
 VALID_MODEL_TIERS = ("light", "medium", "heavy")
 
 
@@ -87,6 +95,21 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     if "tokens_used" not in user_cols:
         conn.execute("ALTER TABLE users ADD COLUMN tokens_used INTEGER NOT NULL DEFAULT 0")
         logger.info("Migrasi DB: kolom 'tokens_used' ditambahkan ke tabel users.")
+    if "model_role" not in user_cols:
+        # PENTING: kolom ini baru (v3 - sistem Role + Tier). Sebelum v3, SEMUA user
+        # cuma punya model_tier yang selalu memetakan ke keluarga model qwen2.5-coder
+        # (tidak ada role "general" sama sekali). Kalau kita backfill kolom baru ini
+        # dengan DEFAULT_MODEL_ROLE ("general"), user LAMA yang sudah terbiasa pakai
+        # model coder akan diam-diam pindah ke model general (llama) begitu mereka
+        # chat lagi -- itu perubahan perilaku yang tidak diinginkan untuk user lama.
+        # Solusinya: tambah kolom dengan DEFAULT SQL 'coder' dulu (berlaku untuk baris
+        # yang sudah ada), baru user BARU (INSERT setelah migrasi ini) yang eksplisit
+        # diberi DEFAULT_MODEL_ROLE ("general") lewat get_or_create_user().
+        conn.execute("ALTER TABLE users ADD COLUMN model_role TEXT NOT NULL DEFAULT 'coder'")
+        logger.info(
+            "Migrasi DB: kolom 'model_role' ditambahkan ke tabel users, "
+            "user lama di-backfill ke role 'coder' (mempertahankan perilaku sebelumnya)."
+        )
 
     # --- redeem_codes: kolom token_value (pengganti limit_value / chat-based) ---
     code_cols = _existing_columns(conn, "redeem_codes")
@@ -117,6 +140,7 @@ def init_db() -> None:
                 telegram_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_seen REAL NOT NULL,
+                model_role TEXT NOT NULL DEFAULT '{DEFAULT_MODEL_ROLE}',
                 model_tier TEXT NOT NULL DEFAULT '{DEFAULT_MODEL_TIER}',
                 token_limit INTEGER NOT NULL DEFAULT {DEFAULT_DAILY_TOKEN_LIMIT},
                 tokens_used INTEGER NOT NULL DEFAULT 0,
@@ -208,11 +232,14 @@ def get_or_create_user(telegram_id: int, username: Optional[str]) -> Dict[str, A
             conn.execute(
                 """
                 INSERT INTO users
-                    (telegram_id, username, first_seen, model_tier, token_limit, tokens_used,
+                    (telegram_id, username, first_seen, model_role, model_tier, token_limit, tokens_used,
                      is_unlimited, plan_expires_at, usage_date, is_banned)
-                VALUES (?, ?, ?, ?, ?, 0, 0, NULL, ?, 0)
+                VALUES (?, ?, ?, ?, ?, ?, 0, 0, NULL, ?, 0)
                 """,
-                (telegram_id, username, time.time(), DEFAULT_MODEL_TIER, DEFAULT_DAILY_TOKEN_LIMIT, today),
+                (
+                    telegram_id, username, time.time(),
+                    DEFAULT_MODEL_ROLE, DEFAULT_MODEL_TIER, DEFAULT_DAILY_TOKEN_LIMIT, today,
+                ),
             )
             row = conn.execute(
                 "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
@@ -274,13 +301,24 @@ def add_token_usage(telegram_id: int, tokens_to_deduct: int) -> None:
         )
 
 
-def set_model_tier(telegram_id: int, tier: str) -> None:
+def set_model_role_tier(telegram_id: int, role: str, tier: str) -> None:
+    """
+    Mengubah role DAN tier model user sekaligus dalam satu UPDATE (atomik), dipanggil
+    setelah user menyelesaikan alur 2 langkah /model (pilih role -> pilih tier).
+    Validasi kombinasi role+tier yang benar-benar tersedia (mis. role 'general' tidak
+    punya tier 'heavy') sengaja TIDAK dilakukan di sini -- itu tanggung jawab
+    ai_engine.resolve_model tempat mapping role->tier->model_name didefinisikan
+    (single source of truth), supaya database tidak perlu duplikasi daftar tier
+    yang valid untuk tiap role.
+    """
+    if role not in VALID_MODEL_ROLES:
+        raise ValueError(f"Role model tidak valid: {role}")
     if tier not in VALID_MODEL_TIERS:
         raise ValueError(f"Tier model tidak valid: {tier}")
     with get_db() as conn:
         conn.execute(
-            "UPDATE users SET model_tier = ? WHERE telegram_id = ?",
-            (tier, telegram_id),
+            "UPDATE users SET model_role = ?, model_tier = ? WHERE telegram_id = ?",
+            (role, tier, telegram_id),
         )
 
 

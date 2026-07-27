@@ -105,16 +105,19 @@ logging.basicConfig(
 logger = logging.getLogger("ai-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # kurangi noise log dari library HTTP internal
 
-MODEL_TIER_LABELS = {
-    "light": "🟢 Light (qwen2.5-coder:1.5b)",
-    "medium": "🟡 Medium (qwen2.5-coder:7b)",
-    "heavy": "🔴 Heavy (qwen2.5-coder:14b)",
-}
-MODEL_TIER_SHORT_LABELS = {
-    "light": "🟢 Light",
-    "medium": "🟡 Medium",
-    "heavy": "🔴 Heavy",
-}
+def model_full_label(role: str, tier: str) -> str:
+    """Label lengkap 'Role - Tier (nama_model)' dipakai di /status dan konfirmasi /model."""
+    role_label = engine.ROLE_LABELS.get(role, role)
+    tier_label = engine.TIER_SHORT_LABELS.get(tier, tier)
+    model_name = engine.resolve_model(role, tier)
+    return f"{role_label} · {tier_label} ({model_name})"
+
+
+def model_short_label(role: str, tier: str) -> str:
+    """Label pendek 'Role · Tier' dipakai di /users (ringkasan admin)."""
+    role_label = engine.ROLE_LABELS.get(role, role)
+    tier_label = engine.TIER_SHORT_LABELS.get(tier, tier)
+    return f"{role_label} · {tier_label}"
 
 GPU_DISABLED_IMAGE_MESSAGE = (
     "⚠️ Maaf, server saat ini berjalan tanpa GPU (CPU-Only). Fitur analisis gambar "
@@ -390,60 +393,148 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =========================================================================
-# COMMAND: /model - pilih tier model AI
+# COMMAND: /model - pilih Role (General/Coder) lalu Tier, lewat Inline Keyboard
 # =========================================================================
+# Alur (state disimpan di Telegram sendiri lewat callback_data, BUKAN di memori bot,
+# supaya aman dipakai bareng banyak user sekaligus tanpa risiko state nyasar/tabrakan
+# antar user -- lihat catatan di callback_model_role/callback_model_tier):
+#   1. /model           -> tampilkan 2 tombol role: General Chat / Coder-IT
+#   2. tap role         -> callback_data "model_role:<role>", tampilkan tombol tier
+#                          untuk role itu + tombol "⬅️ Kembali"
+#   3. tap tier         -> callback_data "model_tier:<role>:<tier>", terapkan &
+#                          konfirmasi, tombol tetap tampil (bisa ganti lagi langsung)
+#   4. tap "⬅️ Kembali" -> callback_data "model_back", kembali ke langkah 1
 
-def _model_keyboard(current_tier: str) -> InlineKeyboardMarkup:
+def _role_keyboard(current_role: str) -> InlineKeyboardMarkup:
     buttons = []
-    for tier in ("light", "medium", "heavy"):
-        label = MODEL_TIER_SHORT_LABELS[tier]
-        if tier == current_tier:
+    for role in ("general", "coder"):
+        label = engine.ROLE_LABELS[role]
+        if role == current_role:
             label += " ✅"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"set_model:{tier}")])
+        buttons.append([InlineKeyboardButton(label, callback_data=f"model_role:{role}")])
     return InlineKeyboardMarkup(buttons)
+
+
+def _tier_keyboard(role: str, current_role: str, current_tier: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for tier in engine.ROLE_TIER_ORDER[role]:
+        label = f"{engine.TIER_SHORT_LABELS[tier]} ({engine.ROLE_TIERS[role][tier]})"
+        if role == current_role and tier == current_tier:
+            label += " ✅"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"model_tier:{role}:{tier}")])
+    buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="model_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _role_select_text(current_role: str, current_tier: str) -> str:
+    return (
+        "🤖 *Pilih Role AI*\n\n"
+        "🗣️ *General Chat* — buat ngobrol santai, tanya-tanya umum, curhat, dll.\n"
+        "💻 *Coder / IT* — buat ngoding, debugging, pertanyaan teknis IT.\n\n"
+        f"Model aktif kamu saat ini: *{model_full_label(current_role, current_tier)}*"
+    )
+
+
+def _tier_select_text(role: str, current_role: str, current_tier: str) -> str:
+    role_label = engine.ROLE_LABELS[role]
+    lines = [f"🤖 *Pilih Tier untuk {role_label}*\n"]
+    for tier in engine.ROLE_TIER_ORDER[role]:
+        model_name = engine.ROLE_TIERS[role][tier]
+        tier_label = engine.TIER_SHORT_LABELS[tier]
+        desc = engine.TIER_DESCRIPTIONS[tier]
+        multiplier = engine.TOKEN_MULTIPLIER[tier]
+        lines.append(f"{tier_label} — `{model_name}`\n   {desc} Kuota token x{multiplier}.\n")
+    lines.append(f"Model aktif kamu saat ini: *{model_full_label(current_role, current_tier)}*")
+    return "\n".join(lines)
 
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     u = db.get_or_create_user(user.id, user.username)
-    current_tier = u["model_tier"]
+    current_role, current_tier = u["model_role"], u["model_tier"]
 
-    text = (
-        "🤖 *Pilih Tier Model AI*\n\n"
-        "🟢 *Light* — qwen2.5-coder:1.5b\n"
-        "   Cepat, super irit CPU. Kuota token x1.\n\n"
-        "🟡 *Medium* — qwen2.5-coder:7b\n"
-        "   Seimbang (default). Kuota token x2.\n\n"
-        "🔴 *Heavy* — qwen2.5-coder:14b\n"
-        "   Reasoning & koding kompleks. Kuota token x3.\n\n"
-        f"Model aktif kamu saat ini: *{MODEL_TIER_LABELS[current_tier]}*"
-    )
     await update.message.reply_text(
-        text,
+        _role_select_text(current_role, current_tier),
         parse_mode=constants.ParseMode.MARKDOWN,
-        reply_markup=_model_keyboard(current_tier),
+        reply_markup=_role_keyboard(current_role),
     )
 
 
-async def callback_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def callback_model_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Langkah 1 -> 2: user memilih role, tampilkan pilihan tier untuk role tsb."""
     query = update.callback_query
     user = query.from_user
-    tier = (query.data or "").split(":", 1)[-1]
+    selected_role = (query.data or "").split(":", 1)[-1]
 
-    if tier not in db.VALID_MODEL_TIERS:
-        await query.answer("❌ Tier tidak valid.", show_alert=True)
+    if selected_role not in db.VALID_MODEL_ROLES:
+        await query.answer("❌ Role tidak valid.", show_alert=True)
+        return
+
+    u = db.get_or_create_user(user.id, user.username)
+    current_role, current_tier = u["model_role"], u["model_tier"]
+
+    await query.answer()
+    try:
+        await query.edit_message_text(
+            _tier_select_text(selected_role, current_role, current_tier),
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=_tier_keyboard(selected_role, current_role, current_tier),
+        )
+    except TelegramError:
+        pass
+
+
+async def callback_model_tier(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Langkah 2: user memilih tier di dalam role yang sudah dipilih -> terapkan."""
+    query = update.callback_query
+    user = query.from_user
+    payload = (query.data or "").split(":")  # ["model_tier", "<role>", "<tier>"]
+
+    if len(payload) != 3:
+        await query.answer("❌ Data tombol tidak valid.", show_alert=True)
+        return
+    _, role, tier = payload
+
+    # Validasi ganda: role & tier masing-masing valid, DAN kombinasinya benar-benar
+    # tersedia (mis. role 'general' tidak punya tier 'heavy') -- dicek langsung ke
+    # ai_engine.ROLE_TIERS (single source of truth) supaya tombol yang sengaja
+    # dipalsukan (callback_data custom dari luar bot) tidak bisa lolos.
+    if role not in db.VALID_MODEL_ROLES or tier not in db.VALID_MODEL_TIERS:
+        await query.answer("❌ Role/tier tidak valid.", show_alert=True)
+        return
+    if tier not in engine.ROLE_TIERS.get(role, {}):
+        await query.answer(f"❌ Tier '{tier}' tidak tersedia untuk role ini.", show_alert=True)
         return
 
     db.get_or_create_user(user.id, user.username)
-    db.set_model_tier(user.id, tier)
+    db.set_model_role_tier(user.id, role, tier)
 
-    await query.answer(f"Model diganti ke {MODEL_TIER_SHORT_LABELS[tier]}")
+    label = model_short_label(role, tier)
+    await query.answer(f"Model diganti ke {label}")
     try:
         await query.edit_message_text(
-            f"✅ Model aktif kamu sekarang: *{MODEL_TIER_LABELS[tier]}*\n\n"
+            f"✅ Model aktif kamu sekarang: *{model_full_label(role, tier)}*\n\n"
             "Kirim pesan untuk mulai chat dengan model ini.",
             parse_mode=constants.ParseMode.MARKDOWN,
-            reply_markup=_model_keyboard(tier),
+            reply_markup=_tier_keyboard(role, role, tier),
+        )
+    except TelegramError:
+        pass
+
+
+async def callback_model_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tombol '⬅️ Kembali' di layar tier -> kembali ke layar pilih role."""
+    query = update.callback_query
+    user = query.from_user
+    u = db.get_or_create_user(user.id, user.username)
+    current_role, current_tier = u["model_role"], u["model_tier"]
+
+    await query.answer()
+    try:
+        await query.edit_message_text(
+            _role_select_text(current_role, current_tier),
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=_role_keyboard(current_role),
         )
     except TelegramError:
         pass
@@ -457,8 +548,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user = update.effective_user
     u = db.get_or_create_user(user.id, user.username)
 
-    tier = u["model_tier"]
-    model_line = f"Model aktif: *{MODEL_TIER_LABELS[tier]}*"
+    role, tier = u["model_role"], u["model_tier"]
+    model_line = f"Model aktif: *{model_full_label(role, tier)}*"
 
     if u["is_unlimited"]:
         limit_line = "♾️ *Unlimited*"
@@ -628,7 +719,7 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [f"👥 *Total user: {total}*\n"]
     for u in users:
         uname = f"@{u['username']}" if u["username"] else "(no username)"
-        tier_flag = MODEL_TIER_SHORT_LABELS.get(u["model_tier"], u["model_tier"])
+        tier_flag = model_short_label(u["model_role"], u["model_tier"])
         if u["is_unlimited"]:
             plan = "Unlimited"
         else:
@@ -751,8 +842,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if u is None:
         return
 
-    tier = u["model_tier"]
-    model_name = engine.resolve_model(tier)
+    role, tier = u["model_role"], u["model_tier"]
+    model_name = engine.resolve_model(role, tier)
     token = user_token_for(telegram_user.id)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
 
@@ -763,7 +854,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Panggilan ke Ollama bisa memakan waktu sampai 10 menit (timeout 600s).
         # Dijalankan di thread terpisah agar event loop bot TIDAK terblokir/hang
         # dan user lain tetap bisa dilayani secara bersamaan.
-        result = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name)
+        result = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name, role)
 
         reply_text = result["content"]
         db.save_message(token, "assistant", reply_text)
@@ -806,8 +897,8 @@ async def _process_and_reply_file(
         )
         return
 
-    tier = u["model_tier"]
-    model_name = engine.resolve_model(tier)
+    role, tier = u["model_role"], u["model_tier"]
+    model_name = engine.resolve_model(role, tier)
     token = user_token_for(telegram_user.id)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
     # Catatan: filename berasal dari user (nama file asli mereka) dan bisa berisi karakter
@@ -837,7 +928,7 @@ async def _process_and_reply_file(
         previous_history = db.get_history(token, limit=engine.MAX_HISTORY_MESSAGES)
         db.save_message(token, "user", user_message)
 
-        result_chat = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name)
+        result_chat = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name, role)
         reply_text = result_chat["content"]
 
         db.save_message(token, "assistant", reply_text)
@@ -954,8 +1045,10 @@ def main() -> None:
     application.add_handler(CommandHandler("reset", cmd_reset))
     application.add_handler(CommandHandler("redeem", cmd_redeem))
 
-    # Callback query (inline button) handler untuk /model
-    application.add_handler(CallbackQueryHandler(callback_set_model, pattern=r"^set_model:"))
+    # Callback query (inline button) handler untuk /model (alur 2 langkah: role -> tier)
+    application.add_handler(CallbackQueryHandler(callback_model_role, pattern=r"^model_role:"))
+    application.add_handler(CallbackQueryHandler(callback_model_tier, pattern=r"^model_tier:"))
+    application.add_handler(CallbackQueryHandler(callback_model_back, pattern=r"^model_back$"))
 
     # Owner-only admin commands
     application.add_handler(CommandHandler("gencode", cmd_gencode))
@@ -976,8 +1069,8 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     logger.info(
-        "Private AI Telegram Bot siap. Tier model: %s | Model vision: %s | Ollama host: %s | Owner ID: %s",
-        engine.MODEL_TIERS, engine.OLLAMA_VISION_MODEL, engine.OLLAMA_HOST, OWNER_ID,
+        "Private AI Telegram Bot siap. Role+Tier model: %s | Model vision: %s | Ollama host: %s | Owner ID: %s",
+        engine.ROLE_TIERS, engine.OLLAMA_VISION_MODEL, engine.OLLAMA_HOST, OWNER_ID,
     )
     logger.info("Menjalankan bot dalam mode polling...")
 
