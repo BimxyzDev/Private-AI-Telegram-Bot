@@ -167,6 +167,31 @@ def init_db() -> None:
             """
         )
 
+        # --- worker_nodes: registry cluster (Master-Worker Architecture) ---
+        # Menyimpan konfigurasi tiap Worker Node (host/port/API key) + cache metrik
+        # kesehatan terakhir (diisi oleh node_manager.health_check_loop). Tabel ini
+        # HANYA relevan/berisi data di Master Node -- Worker Node tidak menulis ke sini.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS worker_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL DEFAULT 3716,
+                api_key TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                cpu_usage REAL,
+                ram_usage REAL,
+                active_tasks INTEGER,
+                latency_ms REAL,
+                models_available TEXT,
+                last_checked REAL,
+                created_at REAL NOT NULL
+            );
+            """
+        )
+
         # Migrasi kolom baru untuk database yang dibuat oleh versi sebelumnya
         _migrate_schema(conn)
 
@@ -437,3 +462,104 @@ def list_codes(limit: int = 50, only_unused: bool = False) -> List[Dict[str, Any
                 "SELECT * FROM redeem_codes ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
     return [dict(r) for r in rows]
+
+
+# =========================================================================
+# WORKER NODE REGISTRY (Master Node — Cluster Architecture)
+# =========================================================================
+# Dipakai oleh node_manager.py (health-check + load balancing) dan
+# master_dashboard.py (CRUD lewat Admin Web UI). Worker Node itu sendiri
+# TIDAK memakai fungsi-fungsi ini sama sekali (registry hanya ada di Master).
+
+def add_worker_node(name: str, host: str, port: int, api_key: str) -> int:
+    """Mendaftarkan Worker Node baru ke cluster. Return id node yang baru dibuat."""
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO worker_nodes (name, host, port, api_key, enabled, status, created_at)
+            VALUES (?, ?, ?, ?, 1, 'unknown', ?)
+            """,
+            (name.strip(), host.strip(), port, api_key.strip(), time.time()),
+        )
+        return cur.lastrowid
+
+
+def list_worker_nodes(enabled_only: bool = False) -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        if enabled_only:
+            rows = conn.execute(
+                "SELECT * FROM worker_nodes WHERE enabled = 1 ORDER BY id ASC"
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM worker_nodes ORDER BY id ASC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_worker_node(node_id: int) -> Optional[Dict[str, Any]]:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM worker_nodes WHERE id = ?", (node_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_worker_node_config(
+    node_id: int,
+    name: Optional[str] = None,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    api_key: Optional[str] = None,
+) -> None:
+    """Update konfigurasi node (dipakai Admin Web UI). Field yang None tidak diubah."""
+    current = get_worker_node(node_id)
+    if not current:
+        raise ValueError(f"Worker node id={node_id} tidak ditemukan.")
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE worker_nodes
+            SET name = ?, host = ?, port = ?, api_key = ?
+            WHERE id = ?
+            """,
+            (
+                (name if name is not None else current["name"]).strip(),
+                (host if host is not None else current["host"]).strip(),
+                port if port is not None else current["port"],
+                (api_key if api_key is not None else current["api_key"]).strip(),
+                node_id,
+            ),
+        )
+
+
+def set_worker_node_enabled(node_id: int, enabled: bool) -> None:
+    """Toggle enable/disable node tanpa perlu restart Telegram Bot maupun Dashboard."""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE worker_nodes SET enabled = ?, status = 'unknown' WHERE id = ?",
+            (1 if enabled else 0, node_id),
+        )
+
+
+def delete_worker_node(node_id: int) -> None:
+    with get_db() as conn:
+        conn.execute("DELETE FROM worker_nodes WHERE id = ?", (node_id,))
+
+
+def update_worker_node_health(
+    node_id: int,
+    status: str,
+    cpu: Optional[float],
+    ram: Optional[float],
+    active_tasks: Optional[int],
+    latency_ms: Optional[float],
+    models_json: Optional[str],
+) -> None:
+    """Dipanggil oleh node_manager.health_check_loop setiap siklus health-check."""
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE worker_nodes
+            SET status = ?, cpu_usage = ?, ram_usage = ?, active_tasks = ?,
+                latency_ms = ?, models_available = ?, last_checked = ?
+            WHERE id = ?
+            """,
+            (status, cpu, ram, active_tasks, latency_ms, models_json, time.time(), node_id),
+        )

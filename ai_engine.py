@@ -57,6 +57,15 @@ class AIEngineError(Exception):
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 
+# --- Mode Cluster (Distributed Master-Worker Architecture) ---
+# "standalone" (default): panggil Ollama lokal langsung di OLLAMA_HOST, seperti
+#   versi single-server sebelumnya. Dipakai kalau bot & Ollama jalan di satu VPS.
+# "master": jangan panggil Ollama lokal sama sekali -- route semua request AI
+#   lewat node_manager.py (Load Balancer) ke Worker Node yang paling sedikit
+#   beban di cluster. Diaktifkan otomatis oleh install.sh saat memilih
+#   "Install Master Node".
+CLUSTER_MODE = os.environ.get("CLUSTER_MODE", "standalone").strip().lower()
+
 # --- Sistem Role + Tier Model ---
 # Dua "role" (kategori pemakaian), tiap role punya beberapa tier (ringan -> berat).
 # Struktur ini dipakai langsung oleh /model (bot.py) untuk membangun inline keyboard
@@ -338,8 +347,34 @@ def extract_text_from_file(filename: str, content: bytes) -> str:
 
 def call_ollama_vision(image_bytes: bytes, prompt: str) -> str:
     """Mengirim satu gambar (raw bytes) + prompt teks ke model vision Ollama."""
-    url = f"{OLLAMA_HOST}/api/generate"
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    if CLUSTER_MODE == "master":
+        return _call_cluster_vision(image_b64, prompt)
+    return _call_local_ollama_vision(image_b64, prompt)
+
+
+def _call_cluster_vision(image_b64: str, prompt: str) -> str:
+    import node_manager
+
+    try:
+        result = node_manager.generate(
+            model_name=OLLAMA_VISION_MODEL,
+            prompt=prompt,
+            images=[image_b64],
+            options={"num_ctx": DEFAULT_NUM_CTX},
+        )
+        return result["content"]
+    except node_manager.NoAvailableWorkerError as e:
+        logger.error("Cluster: tidak ada worker node tersedia untuk vision: %s", e)
+        raise AIEngineError(
+            str(e),
+            "⚠️ Semua Worker Node AI sedang offline/sibuk untuk analisis gambar/video. Coba lagi nanti.",
+        )
+
+
+def _call_local_ollama_vision(image_b64: str, prompt: str) -> str:
+    url = f"{OLLAMA_HOST}/api/generate"
 
     payload = {
         "model": OLLAMA_VISION_MODEL,
@@ -629,6 +664,13 @@ def call_ollama_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
     Timeout diset 600 detik (10 menit) dan context window diset num_ctx=2048
     secara default agar prompt processing tidak lambat.
     """
+    if CLUSTER_MODE == "master":
+        return _call_cluster_chat(messages, model_name)
+    return _call_local_ollama_chat(messages, model_name)
+
+
+def _call_local_ollama_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
+    """Mode 'standalone': panggil Ollama lokal langsung (perilaku versi single-server)."""
     url = f"{OLLAMA_HOST}/api/chat"
     payload = {
         "model": model_name,
@@ -677,6 +719,27 @@ def call_ollama_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
     except Exception as e:
         logger.exception("Error tak terduga saat memanggil Ollama")
         raise AIEngineError(str(e), f"Error tak terduga saat memanggil model AI: {e}")
+
+
+def _call_cluster_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
+    """
+    Mode 'master': route request ke Worker Node paling sedikit beban lewat
+    node_manager.py, dengan failover otomatis. Import dilakukan di sini (bukan
+    di top-level module) supaya ai_engine.py tetap bisa dipakai di Worker Node
+    (yang tidak punya/tidak butuh node_manager.py maupun tabel worker_nodes)
+    tanpa ImportError.
+    """
+    import node_manager
+
+    try:
+        return node_manager.generate(model_name=model_name, messages=messages, options={"num_ctx": DEFAULT_NUM_CTX})
+    except node_manager.NoAvailableWorkerError as e:
+        logger.error("Cluster: tidak ada worker node tersedia: %s", e)
+        raise AIEngineError(
+            str(e),
+            "⚠️ Semua Worker Node AI sedang offline/sibuk. Coba lagi dalam beberapa saat, "
+            "atau hubungi owner bot untuk cek status cluster di Admin Dashboard.",
+        )
 
 
 def chat(user_message: str, history: List[dict], model_name: str, role: Optional[str] = None) -> Dict[str, Any]:

@@ -56,6 +56,28 @@ PTB_VERSION_SPEC="python-telegram-bot[all]>=21.0,<22.0"
 PIP_PACKAGES=("${PTB_VERSION_SPEC}" "requests" "pypdf" "python-docx")
 
 # -----------------------------------------------------------------------------
+# DISTRIBUTED CLUSTER ARCHITECTURE (Master-Worker) - KONFIGURASI
+# -----------------------------------------------------------------------------
+# Master Node : Telegram Bot + Load Balancer (node_manager.py) + Web Dashboard
+#               (master_dashboard.py) + SQLite DB. TIDAK menjalankan Ollama.
+# Worker Node : Ollama + Worker Agent (worker_agent.py), port 3716. Bisa berjumlah
+#               banyak, didaftarkan ke Master lewat Admin Dashboard (/admin).
+WORKER_APP_DIR="/opt/ai-worker"
+WORKER_VENV_DIR="${WORKER_APP_DIR}/venv"
+WORKER_SERVICE_NAME="ai-worker-agent"
+WORKER_SERVICE_USER="aiworker"
+WORKER_ENV_FILE="${WORKER_APP_DIR}/.env"
+DEFAULT_WORKER_PORT=3716
+
+DASHBOARD_SERVICE_NAME="ai-bot-dashboard"
+DEFAULT_DASHBOARD_PORT=8080
+
+FASTAPI_SPEC="fastapi>=0.110,<1.0"
+UVICORN_SPEC="uvicorn[standard]>=0.27,<1.0"
+PIP_PACKAGES_MASTER_EXTRA=("${FASTAPI_SPEC}" "${UVICORN_SPEC}")
+PIP_PACKAGES_WORKER=("${FASTAPI_SPEC}" "${UVICORN_SPEC}" "psutil>=5.9,<6.0" "requests")
+
+# -----------------------------------------------------------------------------
 # WARNA UNTUK OUTPUT TERMINAL
 # -----------------------------------------------------------------------------
 GREEN='\033[0;32m'
@@ -97,13 +119,19 @@ echo ""
 # MENU INTERAKTIF
 # =============================================================================
 echo -e "Pilih mode instalasi:"
-echo -e "  ${GREEN}[1]${NC} Install Baru (Fresh Installation)"
-echo -e "  ${GREEN}[2]${NC} Update Code & Pull Models (Tanpa Menghapus Database)"
+echo -e "  ${GREEN}[1]${NC} Install Baru - Single Server (Ollama + Bot dalam 1 VPS, mode lama)"
+echo -e "  ${GREEN}[2]${NC} Update Code & Pull Models - Single Server (Tanpa Menghapus Database)"
+echo -e "  ${GREEN}[3]${NC} Install MASTER NODE (Cluster: Bot + Load Balancer + Web Dashboard)"
+echo -e "  ${GREEN}[4]${NC} Install WORKER NODE (Cluster: Ollama + Worker Agent, port ${DEFAULT_WORKER_PORT})"
 echo ""
-read -r -p "Masukkan pilihan [1/2]: " INSTALL_MODE < "${TTY_IN}"
-while [[ "${INSTALL_MODE}" != "1" && "${INSTALL_MODE}" != "2" ]]; do
-  log_warn "Pilihan tidak valid. Ketik 1 atau 2."
-  read -r -p "Masukkan pilihan [1/2]: " INSTALL_MODE < "${TTY_IN}"
+echo -e "${YELLOW}Catatan:${NC} Pilih [3]/[4] jika ingin menyebar beban AI ke beberapa VPS"
+echo -e "sekaligus (Distributed Cluster Architecture). Pilih [1]/[2] untuk tetap"
+echo -e "memakai 1 VPS saja seperti sebelumnya (Ollama & Bot di server yang sama)."
+echo ""
+read -r -p "Masukkan pilihan [1/2/3/4]: " INSTALL_MODE < "${TTY_IN}"
+while [[ "${INSTALL_MODE}" != "1" && "${INSTALL_MODE}" != "2" && "${INSTALL_MODE}" != "3" && "${INSTALL_MODE}" != "4" ]]; do
+  log_warn "Pilihan tidak valid. Ketik 1, 2, 3, atau 4."
+  read -r -p "Masukkan pilihan [1/2/3/4]: " INSTALL_MODE < "${TTY_IN}"
 done
 echo ""
 
@@ -673,10 +701,425 @@ print('OK - python-telegram-bot versi', telegram.__version__)
 }
 
 # =============================================================================
+# CLUSTER: MASTER NODE (Bot + Load Balancer + Web Dashboard, TANPA Ollama lokal)
+# =============================================================================
+setup_master_bot_systemd() {
+  log_info "Membuat/memperbarui systemd service '${SERVICE_NAME}' (Master - Telegram Bot)..."
+  cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Private AI Telegram Bot - Master Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+WorkingDirectory=${APP_DIR}
+Environment="CLUSTER_MODE=master"
+Environment="OLLAMA_NUM_CTX=2048"
+Environment="AI_BOT_DB_PATH=${APP_DIR}/bot_data.db"
+Environment="NODE_HEALTH_CHECK_INTERVAL=7"
+EnvironmentFile=${ENV_FILE}
+ExecStart=${VENV_DIR}/bin/python3 ${APP_DIR}/bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=${APP_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "${SERVICE_NAME}"
+  systemctl restart "${SERVICE_NAME}"
+  sleep 4
+
+  if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    log_success "Service ${SERVICE_NAME} (Master Bot) berhasil berjalan."
+  else
+    log_error "Service ${SERVICE_NAME} GAGAL berjalan. Cek log: journalctl -u ${SERVICE_NAME} -n 50"
+  fi
+  echo ""
+}
+
+setup_master_dashboard_systemd() {
+  log_info "Membuat/memperbarui systemd service '${DASHBOARD_SERVICE_NAME}' (Web Dashboard)..."
+  cat > "/etc/systemd/system/${DASHBOARD_SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Private AI Telegram Bot - Cluster Dashboard (Master Node)
+After=network-online.target ${SERVICE_NAME}.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+WorkingDirectory=${APP_DIR}
+Environment="DB_PATH=${APP_DIR}/bot_data.db"
+EnvironmentFile=${ENV_FILE}
+ExecStart=${VENV_DIR}/bin/uvicorn master_dashboard:app --host 0.0.0.0 --port ${DASHBOARD_PORT_INPUT}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=${APP_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "${DASHBOARD_SERVICE_NAME}"
+  systemctl restart "${DASHBOARD_SERVICE_NAME}"
+  sleep 3
+
+  if systemctl is-active --quiet "${DASHBOARD_SERVICE_NAME}"; then
+    log_success "Service ${DASHBOARD_SERVICE_NAME} (Dashboard) berhasil berjalan di port ${DASHBOARD_PORT_INPUT}."
+  else
+    log_error "Service ${DASHBOARD_SERVICE_NAME} GAGAL berjalan. Cek log: journalctl -u ${DASHBOARD_SERVICE_NAME} -n 50"
+  fi
+  echo ""
+}
+
+print_master_footer() {
+  SERVER_IP_HINT="$(curl -s --max-time 3 https://api.ipify.org || echo '<IP-VPS-Anda>')"
+  echo ""
+  echo -e "${GREEN}${BOLD}=================================================================${NC}"
+  echo -e "${GREEN}${BOLD}   MASTER NODE SIAP - CLUSTER DISTRIBUTED ARCHITECTURE${NC}"
+  echo -e "${GREEN}${BOLD}=================================================================${NC}"
+  echo ""
+  echo -e "${BLUE}${BOLD}1. TELEGRAM BOT${NC}"
+  echo -e "   Kirim ${GREEN}/start${NC} ke bot Anda di Telegram. Bot akan menjawab TAPI"
+  echo -e "   ${YELLOW}TIDAK ADA Worker Node terdaftar sampai Anda menambahkannya${NC} (langkah 3)."
+  echo ""
+  echo -e "${BLUE}${BOLD}2. WEB DASHBOARD (Status Publik + Admin)${NC}"
+  echo -e "   Status publik cluster : ${GREEN}http://${SERVER_IP_HINT}:${DASHBOARD_PORT_INPUT}/${NC}"
+  echo -e "   Admin panel (kelola node) : ${GREEN}http://${SERVER_IP_HINT}:${DASHBOARD_PORT_INPUT}/admin${NC}"
+  echo -e "   Login admin : ${GREEN}${ADMIN_USERNAME_INPUT}${NC} / (password sesuai input Anda tadi)"
+  echo -e "   ${YELLOW}Buka port ${DASHBOARD_PORT_INPUT}/tcp di firewall/security-group VPS ini.${NC}"
+  echo ""
+  echo -e "${BLUE}${BOLD}3. MENAMBAHKAN WORKER NODE${NC}"
+  echo -e "   a. Jalankan installer ini di VPS lain, pilih ${GREEN}[4] Install Worker Node${NC}."
+  echo -e "   b. Catat IP VPS worker, port (default ${DEFAULT_WORKER_PORT}), dan API Key yang"
+  echo -e "      ditampilkan di akhir instalasi worker tsb."
+  echo -e "   c. Buka Admin Dashboard di atas -> isi form 'Tambah Worker Node Baru' -> Submit."
+  echo -e "   d. Node akan online otomatis dalam ${GREEN}~7 detik${NC} (health-check berkala),"
+  echo -e "      TANPA perlu restart Telegram Bot maupun Dashboard."
+  echo ""
+  echo -e "${BLUE}${BOLD}4. LOAD BALANCING${NC}"
+  echo -e "   Setiap chat/analisis gambar-video dari user dirutekan otomatis ke Worker Node"
+  echo -e "   yang paling sedikit beban (active_tasks, lalu CPU/RAM). Jika node yang dipilih"
+  echo -e "   gagal/timeout, request otomatis failover ke node berikutnya."
+  echo ""
+  echo -e "${BLUE}${BOLD}5. LOG & SERVICE${NC}"
+  echo -e "   Log bot        : ${GREEN}sudo journalctl -u ${SERVICE_NAME} -f${NC}"
+  echo -e "   Log dashboard  : ${GREEN}sudo journalctl -u ${DASHBOARD_SERVICE_NAME} -f${NC}"
+  echo -e "   Restart bot    : ${GREEN}sudo systemctl restart ${SERVICE_NAME}${NC}"
+  echo -e "   Restart dash.  : ${GREEN}sudo systemctl restart ${DASHBOARD_SERVICE_NAME}${NC}"
+  echo -e "   Config rahasia : ${GREEN}${ENV_FILE}${NC}"
+  echo ""
+  echo -e "${YELLOW}${BOLD}PENTING - KEAMANAN:${NC}"
+  echo -e "  - Ganti ADMIN_USERNAME/ADMIN_PASSWORD di ${ENV_FILE} kapan saja lalu restart"
+  echo -e "    ${DASHBOARD_SERVICE_NAME} untuk menerapkannya."
+  echo -e "  - API Key tiap Worker Node HARUS unik dan dijaga kerahasiaannya (dipakai di header"
+  echo -e "    X-API-KEY saat Master memanggil Worker)."
+  echo -e "${GREEN}${BOLD}=================================================================${NC}"
+}
+
+install_master_node_flow() {
+  echo -e "${BOLD}=================================================================${NC}"
+  echo -e "${BOLD}   INSTALL MASTER NODE (CLUSTER DISTRIBUTED ARCHITECTURE)${NC}"
+  echo -e "${BOLD}=================================================================${NC}"
+  echo ""
+  echo -e "Master Node menjalankan: Telegram Bot, Load Balancer (node_manager.py),"
+  echo -e "Web Dashboard (status publik + admin), dan database SQLite."
+  echo -e "${YELLOW}Ollama TIDAK diinstall di sini${NC} -- AI generation dijalankan oleh"
+  echo -e "Worker Node yang Anda daftarkan lewat Admin Dashboard nanti."
+  echo ""
+
+  install_system_dependencies
+
+  if id "${SERVICE_USER}" &>/dev/null; then
+    log_warn "User sistem '${SERVICE_USER}' sudah ada."
+  else
+    log_info "Membuat user sistem '${SERVICE_USER}'..."
+    useradd --system --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
+  fi
+
+  log_info "Menyiapkan direktori aplikasi di ${APP_DIR}..."
+  mkdir -p "${APP_DIR}"
+  if [[ -d "${APP_DIR}/.git" ]]; then
+    git config --global --add safe.directory "${APP_DIR}" || true
+    if git -C "${APP_DIR}" remote get-url origin &>/dev/null; then
+      git -C "${APP_DIR}" remote set-url origin "${REPO_GIT_URL}"
+    else
+      git -C "${APP_DIR}" remote add origin "${REPO_GIT_URL}"
+    fi
+    git -C "${APP_DIR}" fetch origin
+    git -C "${APP_DIR}" reset --hard "origin/${REPO_BRANCH}"
+  else
+    log_info "Meng-clone repository dari ${REPO_GIT_URL}..."
+    TMP_CLONE="$(mktemp -d)"
+    git clone --branch "${REPO_BRANCH}" --depth 1 "${REPO_GIT_URL}" "${TMP_CLONE}"
+    cp -rf "${TMP_CLONE}/." "${APP_DIR}/"
+    rm -rf "${TMP_CLONE}"
+  fi
+  if [[ -d "${APP_DIR}/.git" ]]; then
+    { echo ".env"; echo "${DB_FILE_NAME}"; echo "${DB_FILE_NAME}.gz"; echo "venv/"; } > "${APP_DIR}/.git/info/exclude"
+  fi
+  log_success "File aplikasi Master Node siap."
+  echo ""
+
+  setup_python_venv
+  log_info "Menginstall dependency tambahan Master (fastapi, uvicorn) untuk Web Dashboard..."
+  "${VENV_DIR}/bin/pip" install -q --upgrade "${PIP_PACKAGES_MASTER_EXTRA[@]}"
+  log_success "Dependency Master lengkap."
+  echo ""
+
+  echo -e "${BOLD}--- Konfigurasi Bot Telegram ---${NC}"
+  read -r -p "Masukkan Token Bot Telegram: " BOT_TOKEN_INPUT < "${TTY_IN}"
+  while [[ -z "${BOT_TOKEN_INPUT// }" ]]; do
+    log_warn "Token bot tidak boleh kosong."
+    read -r -p "Masukkan Token Bot Telegram: " BOT_TOKEN_INPUT < "${TTY_IN}"
+  done
+  read -r -p "Masukkan ID Telegram Owner (angka): " OWNER_ID_INPUT < "${TTY_IN}"
+  while ! [[ "${OWNER_ID_INPUT// }" =~ ^-?[0-9]+$ ]]; do
+    log_warn "ID Owner harus berupa angka."
+    read -r -p "Masukkan ID Telegram Owner (angka): " OWNER_ID_INPUT < "${TTY_IN}"
+  done
+  echo ""
+
+  echo -e "${BOLD}--- Konfigurasi Web Dashboard (Admin Panel) ---${NC}"
+  read -r -p "Username admin dashboard: " ADMIN_USERNAME_INPUT < "${TTY_IN}"
+  while [[ -z "${ADMIN_USERNAME_INPUT// }" ]]; do
+    log_warn "Username tidak boleh kosong."
+    read -r -p "Username admin dashboard: " ADMIN_USERNAME_INPUT < "${TTY_IN}"
+  done
+  read -r -s -p "Password admin dashboard: " ADMIN_PASSWORD_INPUT < "${TTY_IN}"
+  echo ""
+  while [[ -z "${ADMIN_PASSWORD_INPUT// }" ]]; do
+    log_warn "Password tidak boleh kosong."
+    read -r -s -p "Password admin dashboard: " ADMIN_PASSWORD_INPUT < "${TTY_IN}"
+    echo ""
+  done
+  read -r -p "Port Web Dashboard [default: ${DEFAULT_DASHBOARD_PORT}]: " DASHBOARD_PORT_INPUT < "${TTY_IN}"
+  DASHBOARD_PORT_INPUT="${DASHBOARD_PORT_INPUT:-${DEFAULT_DASHBOARD_PORT}}"
+  echo ""
+
+  log_info "Menyimpan konfigurasi ke ${ENV_FILE}..."
+  umask 077
+  cat > "${ENV_FILE}" <<EOF
+# File ini berisi rahasia (secrets). JANGAN commit/upload ke Git atau tempat publik manapun.
+TELEGRAM_BOT_TOKEN=${BOT_TOKEN_INPUT}
+OWNER_TELEGRAM_ID=${OWNER_ID_INPUT}
+CLUSTER_MODE=master
+ADMIN_USERNAME=${ADMIN_USERNAME_INPUT}
+ADMIN_PASSWORD=${ADMIN_PASSWORD_INPUT}
+DASHBOARD_PORT=${DASHBOARD_PORT_INPUT}
+GH_BACKUP_ENABLED=${GH_BACKUP_ENABLED:-false}
+GH_BACKUP_PAT=${GH_PAT_INPUT:-}
+GH_BACKUP_REPO=${GH_BACKUP_REPO:-}
+GH_BACKUP_BRANCH=${GH_BACKUP_BRANCH:-main}
+GH_BACKUP_PATH=${GH_BACKUP_PATH:-${DB_FILE_NAME}.gz}
+EOF
+  chmod 600 "${ENV_FILE}"
+  log_success "Konfigurasi Master Node disimpan (chmod 600)."
+  chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
+  echo ""
+
+  github_auto_setup
+  chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
+
+  migrate_database
+
+  log_info "Memvalidasi instalasi Master (import check)..."
+  if "${VENV_DIR}/bin/python3" -c "
+import sys
+sys.path.insert(0, '${APP_DIR}')
+import telegram, database, ai_engine, node_manager, master_dashboard
+print('OK - modul Master Node lengkap (bot + node_manager + dashboard).')
+"; then
+    log_success "Validasi modul Master berhasil."
+  else
+    log_error "Validasi modul GAGAL. Service TIDAK diaktifkan sampai masalah diperbaiki."
+    exit 1
+  fi
+  echo ""
+
+  setup_master_bot_systemd
+  setup_master_dashboard_systemd
+  print_master_footer
+}
+
+# =============================================================================
+# CLUSTER: WORKER NODE (Ollama + Worker Agent, port 3716)
+# =============================================================================
+setup_worker_systemd() {
+  log_info "Membuat/memperbarui systemd service '${WORKER_SERVICE_NAME}'..."
+  cat > "/etc/systemd/system/${WORKER_SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=AI Bot Cluster - Worker Node Agent
+After=network-online.target ollama.service
+Wants=network-online.target ollama.service
+
+[Service]
+Type=simple
+User=${WORKER_SERVICE_USER}
+Group=${WORKER_SERVICE_USER}
+WorkingDirectory=${WORKER_APP_DIR}
+EnvironmentFile=${WORKER_ENV_FILE}
+ExecStart=${WORKER_VENV_DIR}/bin/uvicorn worker_agent:app --host 0.0.0.0 --port ${WORKER_PORT_INPUT}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=${WORKER_APP_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "${WORKER_SERVICE_NAME}"
+  systemctl restart "${WORKER_SERVICE_NAME}"
+  sleep 3
+
+  if systemctl is-active --quiet "${WORKER_SERVICE_NAME}"; then
+    log_success "Service ${WORKER_SERVICE_NAME} berhasil berjalan di port ${WORKER_PORT_INPUT}."
+  else
+    log_error "Service ${WORKER_SERVICE_NAME} GAGAL berjalan. Cek log: journalctl -u ${WORKER_SERVICE_NAME} -n 50"
+  fi
+  echo ""
+}
+
+print_worker_footer() {
+  SERVER_IP_HINT="$(curl -s --max-time 3 https://api.ipify.org || echo '<IP-VPS-Anda>')"
+  echo ""
+  echo -e "${GREEN}${BOLD}=================================================================${NC}"
+  echo -e "${GREEN}${BOLD}   WORKER NODE SIAP${NC}"
+  echo -e "${GREEN}${BOLD}=================================================================${NC}"
+  echo ""
+  echo -e "Daftarkan node ini di Admin Dashboard Master Node dengan data berikut:"
+  echo ""
+  echo -e "   Host / IP  : ${GREEN}${SERVER_IP_HINT}${NC}"
+  echo -e "   Port       : ${GREEN}${WORKER_PORT_INPUT}${NC}"
+  echo -e "   API Key    : ${GREEN}${WORKER_API_KEY_INPUT}${NC}"
+  echo ""
+  echo -e "${YELLOW}Simpan API Key di atas -- tidak ditampilkan ulang secara otomatis.${NC}"
+  echo -e "${YELLOW}Buka port ${WORKER_PORT_INPUT}/tcp di firewall/security-group VPS ini${NC}"
+  echo -e "${YELLOW}(hanya perlu bisa diakses dari IP Master Node, idealnya dibatasi lewat firewall).${NC}"
+  echo ""
+  echo -e "${BLUE}${BOLD}Model yang sudah di-pull di node ini:${NC}"
+  for model in "${ALL_MODELS[@]}"; do
+    echo -e "   - ${GREEN}${model}${NC}"
+  done
+  echo ""
+  echo -e "${BLUE}${BOLD}LOG & SERVICE${NC}"
+  echo -e "   Log worker agent : ${GREEN}sudo journalctl -u ${WORKER_SERVICE_NAME} -f${NC}"
+  echo -e "   Restart worker   : ${GREEN}sudo systemctl restart ${WORKER_SERVICE_NAME}${NC}"
+  echo -e "   Restart Ollama   : ${GREEN}sudo systemctl restart ollama${NC}"
+  echo -e "   Config           : ${GREEN}${WORKER_ENV_FILE}${NC}"
+  echo -e "${GREEN}${BOLD}=================================================================${NC}"
+}
+
+install_worker_node_flow() {
+  echo -e "${BOLD}=================================================================${NC}"
+  echo -e "${BOLD}   INSTALL WORKER NODE (CLUSTER DISTRIBUTED ARCHITECTURE)${NC}"
+  echo -e "${BOLD}=================================================================${NC}"
+  echo ""
+  echo -e "Worker Node menjalankan: Ollama + Worker Agent (FastAPI, port ${DEFAULT_WORKER_PORT})."
+  echo -e "Setelah instalasi selesai, daftarkan node ini ke Master Node lewat Admin Dashboard."
+  echo ""
+
+  install_system_dependencies
+  install_ollama_if_needed
+  pull_all_models
+
+  if id "${WORKER_SERVICE_USER}" &>/dev/null; then
+    log_warn "User sistem '${WORKER_SERVICE_USER}' sudah ada."
+  else
+    log_info "Membuat user sistem '${WORKER_SERVICE_USER}'..."
+    useradd --system --no-create-home --shell /usr/sbin/nologin "${WORKER_SERVICE_USER}"
+  fi
+
+  log_info "Menyiapkan direktori Worker Agent di ${WORKER_APP_DIR}..."
+  mkdir -p "${WORKER_APP_DIR}"
+  TMP_CLONE="$(mktemp -d)"
+  git clone --branch "${REPO_BRANCH}" --depth 1 "${REPO_GIT_URL}" "${TMP_CLONE}"
+  cp -f "${TMP_CLONE}/worker_agent.py" "${WORKER_APP_DIR}/worker_agent.py"
+  rm -rf "${TMP_CLONE}"
+  log_success "worker_agent.py siap di ${WORKER_APP_DIR}."
+  echo ""
+
+  log_info "Membuat virtual environment Python untuk Worker Agent..."
+  if [[ ! -d "${WORKER_VENV_DIR}" ]]; then
+    python3 -m venv "${WORKER_VENV_DIR}"
+  fi
+  "${WORKER_VENV_DIR}/bin/pip" install --upgrade pip -q
+  "${WORKER_VENV_DIR}/bin/pip" install -q --upgrade "${PIP_PACKAGES_WORKER[@]}"
+  log_success "Dependency Worker Agent terinstall."
+  echo ""
+
+  echo -e "${BOLD}--- Konfigurasi Worker Agent ---${NC}"
+  DEFAULT_GENERATED_KEY="$(openssl rand -hex 24 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 48)"
+  read -r -p "API Key untuk node ini [default: acak aman, tekan Enter untuk pakai]: " WORKER_API_KEY_INPUT < "${TTY_IN}"
+  WORKER_API_KEY_INPUT="${WORKER_API_KEY_INPUT:-${DEFAULT_GENERATED_KEY}}"
+
+  read -r -p "Port Worker Agent [default: ${DEFAULT_WORKER_PORT}]: " WORKER_PORT_INPUT < "${TTY_IN}"
+  WORKER_PORT_INPUT="${WORKER_PORT_INPUT:-${DEFAULT_WORKER_PORT}}"
+  echo ""
+
+  log_info "Menyimpan konfigurasi ke ${WORKER_ENV_FILE}..."
+  umask 077
+  cat > "${WORKER_ENV_FILE}" <<EOF
+# File ini berisi rahasia (API key). JANGAN bagikan ke pihak tidak tepercaya.
+WORKER_API_KEY=${WORKER_API_KEY_INPUT}
+OLLAMA_HOST=http://127.0.0.1:11434
+OLLAMA_NUM_CTX=2048
+WORKER_REQUEST_TIMEOUT_SECONDS=600
+EOF
+  chmod 600 "${WORKER_ENV_FILE}"
+  chown -R "${WORKER_SERVICE_USER}:${WORKER_SERVICE_USER}" "${WORKER_APP_DIR}"
+  log_success "Konfigurasi Worker Node disimpan (chmod 600)."
+  echo ""
+
+  log_info "Memvalidasi instalasi Worker (import check)..."
+  if "${WORKER_VENV_DIR}/bin/python3" -c "
+import fastapi, uvicorn, psutil, requests
+print('OK - modul Worker Agent lengkap.')
+"; then
+    log_success "Validasi modul Worker berhasil."
+  else
+    log_error "Validasi modul GAGAL. Service TIDAK diaktifkan sampai masalah diperbaiki."
+    exit 1
+  fi
+  echo ""
+
+  setup_worker_systemd
+  print_worker_footer
+}
+
+# =============================================================================
 # EKSEKUSI SESUAI PILIHAN MENU
 # =============================================================================
-if [[ "${INSTALL_MODE}" == "1" ]]; then
-  run_fresh_install_flow
-else
-  run_update_flow
-fi
+case "${INSTALL_MODE}" in
+  1) run_fresh_install_flow ;;
+  2) run_update_flow ;;
+  3) install_master_node_flow ;;
+  4) install_worker_node_flow ;;
+esac

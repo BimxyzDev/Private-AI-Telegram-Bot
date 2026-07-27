@@ -358,12 +358,26 @@ async def _post_init_start_backup(application: Application) -> None:
         logger.info(
             "GH backup: dinonaktifkan (GH_BACKUP_ENABLED != true, atau PAT/repo belum diset)."
         )
-        return
-    application.create_task(github_auto_backup_loop(application))
-    logger.info(
-        "GH backup: auto-backup ke %s (%s) tiap %ss AKTIF.",
-        GH_BACKUP_REPO, GH_BACKUP_PATH, GH_BACKUP_INTERVAL_SEC,
-    )
+    else:
+        application.create_task(github_auto_backup_loop(application))
+        logger.info(
+            "GH backup: auto-backup ke %s (%s) tiap %ss AKTIF.",
+            GH_BACKUP_REPO, GH_BACKUP_PATH, GH_BACKUP_INTERVAL_SEC,
+        )
+
+    # --- Distributed Cluster Architecture: Master Node Load Balancer ---
+    # Hanya relevan jika CLUSTER_MODE=master (diset oleh install.sh saat memilih
+    # "Install Master Node"). Health-check loop berjalan di background thread
+    # terpisah (lihat node_manager.py) supaya tidak mengganggu event loop bot.
+    if engine.CLUSTER_MODE == "master":
+        import node_manager
+        node_manager.start_health_check_loop()
+        logger.info(
+            "Cluster Mode AKTIF (master): health-check Worker Node tiap %ss.",
+            node_manager.NODE_HEALTH_CHECK_INTERVAL_SECONDS,
+        )
+    else:
+        logger.info("Cluster Mode: standalone (memanggil Ollama lokal langsung, tanpa Worker Node).")
 
 
 # =========================================================================
