@@ -44,7 +44,7 @@ VALID_MODEL_ROLES = ("general", "coder")
 # ai_engine.resolve_model (fallback otomatis), bukan di sini -- supaya database
 # tidak perlu tahu daftar tier yang valid untuk tiap role (single source of truth
 # ada di ai_engine.ROLE_TIERS).
-VALID_MODEL_TIERS = ("light", "medium", "heavy")
+VALID_MODEL_TIERS = ("super_ringan", "light", "medium", "heavy")
 
 
 def set_db_path(path: str) -> None:

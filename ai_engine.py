@@ -85,8 +85,10 @@ MASTER_OLLAMA_FALLBACK = os.environ.get("MASTER_OLLAMA_FALLBACK", "false").strip
 # tanpa edit source code.
 ROLE_TIERS: Dict[str, Dict[str, str]] = {
     "general": {
+        "super_ringan": os.environ.get("OLLAMA_MODEL_GENERAL_SUPER_RINGAN", "qwen2.5:1.5b"),
         "light": os.environ.get("OLLAMA_MODEL_GENERAL_LIGHT", "llama3.2:3b"),
         "medium": os.environ.get("OLLAMA_MODEL_GENERAL_MEDIUM", "llama3.1:8b"),
+        "heavy": os.environ.get("OLLAMA_MODEL_GENERAL_HEAVY", "gemma2:9b"),
     },
     "coder": {
         "light": os.environ.get("OLLAMA_MODEL_CODER_LIGHT", "qwen2.5-coder:1.5b"),
@@ -103,6 +105,7 @@ ROLE_LABELS: Dict[str, str] = {
 
 # Label pendek per tier (dipakai untuk tombol & ringkasan)
 TIER_SHORT_LABELS: Dict[str, str] = {
+    "super_ringan": "⚪ Super Ringan",
     "light": "🟢 Light",
     "medium": "🟡 Medium",
     "heavy": "🔴 Heavy",
@@ -110,6 +113,7 @@ TIER_SHORT_LABELS: Dict[str, str] = {
 
 # Deskripsi singkat tiap tier, dipakai untuk teks penjelasan di /model.
 TIER_DESCRIPTIONS: Dict[str, str] = {
+    "super_ringan": "Paling irit kuota & tercepat di CPU. Cocok untuk chat singkat/tanya cepat.",
     "light": "Paling cepat & ringan di CPU. Cocok untuk obrolan singkat/pertanyaan simpel.",
     "medium": "Seimbang antara kualitas jawaban dan kecepatan. Cocok dipakai sehari-hari.",
     "heavy": "Kualitas & reasoning terbaik, lebih lambat & lebih berat di CPU.",
@@ -117,7 +121,7 @@ TIER_DESCRIPTIONS: Dict[str, str] = {
 
 # Urutan tier per role (ringan -> berat), dipakai untuk urutan tombol supaya konsisten.
 ROLE_TIER_ORDER: Dict[str, List[str]] = {
-    "general": ["light", "medium"],
+    "general": ["super_ringan", "light", "medium", "heavy"],
     "coder": ["light", "medium", "heavy"],
 }
 
@@ -125,6 +129,7 @@ ROLE_TIER_ORDER: Dict[str, List[str]] = {
 # model yang menentukan beban, bukan role-nya). Contoh: 1.000 token asli hasil Ollama
 # pada tier medium (2x) memotong 2.000 token kuota user.
 TOKEN_MULTIPLIER: Dict[str, int] = {
+    "super_ringan": 1,
     "light": 1,
     "medium": 2,
     "heavy": 3,

@@ -213,6 +213,37 @@ restart_if_exists() {
 }
 
 # -----------------------------------------------------------------------------
+# PULL MODEL OLLAMA BARU (jika ada model baru ditambahkan di rilis ini)
+# -----------------------------------------------------------------------------
+# Dibaca dari .env app_dir (bukan hardcode) supaya override model milik owner
+# (lewat OLLAMA_MODEL_*) tetap dihormati -- persis sama seperti cara install.sh
+# menentukan model yang di-pull. Kalau .env belum punya var model baru (instalasi
+# lama sebelum rilis ini), dipakai default bawaan sesuai ai_engine.py.
+pull_new_models() {
+  local app_dir="$1"
+  local env_file="${app_dir}/.env"
+
+  if ! command -v ollama &>/dev/null; then
+    return
+  fi
+
+  # shellcheck disable=SC1090
+  local super_ringan light medium heavy
+  super_ringan="$(grep -oP '^OLLAMA_MODEL_GENERAL_SUPER_RINGAN=\K.*' "${env_file}" 2>/dev/null || echo "qwen2.5:1.5b")"
+  heavy="$(grep -oP '^OLLAMA_MODEL_GENERAL_HEAVY=\K.*' "${env_file}" 2>/dev/null || echo "gemma2:9b")"
+
+  local new_models=("${super_ringan}" "${heavy}")
+  for model in "${new_models[@]}"; do
+    log_info "Menarik model AI baru '${model}' (jika belum ada, cepat jika sudah)..."
+    if ollama pull "${model}"; then
+      log_success "Model '${model}' siap dipakai."
+    else
+      log_warn "Gagal menarik model '${model}'. Cek koneksi/disk, lalu jalankan manual: ollama pull ${model}"
+    fi
+  done
+}
+
+# -----------------------------------------------------------------------------
 # DETEKSI JENIS INSTALASI & EKSEKUSI
 # -----------------------------------------------------------------------------
 UPDATED_ANY=0
@@ -221,6 +252,7 @@ if [[ -d "${MASTER_APP_DIR}" ]]; then
   echo -e "${BOLD}--- Terdeteksi instalasi di ${MASTER_APP_DIR} (Single-Server / Master Node) ---${NC}"
   update_app_dir "${MASTER_APP_DIR}"
   migrate_database_in "${MASTER_APP_DIR}" || true
+  pull_new_models "${MASTER_APP_DIR}"
   chown -R "$(stat -c '%U:%G' "${MASTER_APP_DIR}")" "${MASTER_APP_DIR}" 2>/dev/null || true
   chmod 600 "${MASTER_APP_DIR}/.env" 2>/dev/null || true
   restart_if_exists "${MASTER_SERVICE_NAME}"
@@ -232,6 +264,7 @@ fi
 if [[ -d "${WORKER_APP_DIR}" ]]; then
   echo -e "${BOLD}--- Terdeteksi instalasi di ${WORKER_APP_DIR} (Worker Node) ---${NC}"
   update_app_dir "${WORKER_APP_DIR}"
+  pull_new_models "${WORKER_APP_DIR}"
   chown -R "$(stat -c '%U:%G' "${WORKER_APP_DIR}")" "${WORKER_APP_DIR}" 2>/dev/null || true
   chmod 600 "${WORKER_APP_DIR}/.env" 2>/dev/null || true
   restart_if_exists "${WORKER_SERVICE_NAME}"
