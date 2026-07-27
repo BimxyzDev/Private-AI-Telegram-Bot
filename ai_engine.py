@@ -60,11 +60,20 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 # --- Mode Cluster (Distributed Master-Worker Architecture) ---
 # "standalone" (default): panggil Ollama lokal langsung di OLLAMA_HOST, seperti
 #   versi single-server sebelumnya. Dipakai kalau bot & Ollama jalan di satu VPS.
-# "master": jangan panggil Ollama lokal sama sekali -- route semua request AI
-#   lewat node_manager.py (Load Balancer) ke Worker Node yang paling sedikit
-#   beban di cluster. Diaktifkan otomatis oleh install.sh saat memilih
-#   "Install Master Node".
+# "master": route semua request AI lewat node_manager.py (Load Balancer) ke
+#   Worker Node yang paling sedikit beban di cluster. Diaktifkan otomatis oleh
+#   install.sh saat memilih "Install Master Node".
 CLUSTER_MODE = os.environ.get("CLUSTER_MODE", "standalone").strip().lower()
+
+# --- Ollama Fallback di Master Node (opsional, nonaktif secara default) ---
+# Jika "true" DAN CLUSTER_MODE="master": ketika SEMUA Worker Node di cluster
+# gagal/offline (node_manager.NoAvailableWorkerError), Master Node mencoba
+# memanggil Ollama LOKAL (OLLAMA_HOST) sebagai cadangan terakhir, alih-alih
+# langsung menolak request user. Diaktifkan lewat install.sh (opsi "Ollama
+# Fallback" saat Install Master Node) yang JUGA otomatis membatasi Ollama
+# lokal ke maksimal 70% CPU & 70% RAM (lihat ollama-limit.conf) supaya Bot/
+# Dashboard di Master Node yang sama tidak ikut crash/OOM saat fallback aktif.
+MASTER_OLLAMA_FALLBACK = os.environ.get("MASTER_OLLAMA_FALLBACK", "false").strip().lower() == "true"
 
 # --- Sistem Role + Tier Model ---
 # Dua "role" (kategori pemakaian), tiap role punya beberapa tier (ringan -> berat).
@@ -355,6 +364,11 @@ def call_ollama_vision(image_bytes: bytes, prompt: str) -> str:
 
 
 def _call_cluster_vision(image_b64: str, prompt: str) -> str:
+    """
+    Mode 'master': route request vision ke Worker Node lewat node_manager.py.
+    Jika SEMUA Worker Node gagal DAN MASTER_OLLAMA_FALLBACK aktif, dicoba
+    sekali lagi lewat Ollama lokal di Master Node sendiri sebelum menyerah.
+    """
     import node_manager
 
     try:
@@ -366,6 +380,18 @@ def _call_cluster_vision(image_b64: str, prompt: str) -> str:
         )
         return result["content"]
     except node_manager.NoAvailableWorkerError as e:
+        if MASTER_OLLAMA_FALLBACK:
+            logger.warning(
+                "Cluster: semua Worker Node gagal untuk vision (%s) -- mencoba fallback ke Ollama lokal.", e
+            )
+            try:
+                return _call_local_ollama_vision(image_b64, prompt)
+            except AIEngineError:
+                raise AIEngineError(
+                    str(e),
+                    "⚠️ Semua Worker Node AI sedang offline/sibuk, dan Ollama Fallback "
+                    "di Master Node juga gagal memproses gambar/video ini. Coba lagi nanti.",
+                )
         logger.error("Cluster: tidak ada worker node tersedia untuk vision: %s", e)
         raise AIEngineError(
             str(e),
@@ -728,12 +754,32 @@ def _call_cluster_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
     di top-level module) supaya ai_engine.py tetap bisa dipakai di Worker Node
     (yang tidak punya/tidak butuh node_manager.py maupun tabel worker_nodes)
     tanpa ImportError.
+
+    Jika SEMUA Worker Node gagal DAN MASTER_OLLAMA_FALLBACK aktif, dicoba
+    sekali lagi lewat Ollama lokal di Master Node sendiri (lihat env var
+    MASTER_OLLAMA_FALLBACK, diaktifkan opsional lewat install.sh) sebelum
+    benar-benar menyerah ke user.
     """
     import node_manager
 
     try:
         return node_manager.generate(model_name=model_name, messages=messages, options={"num_ctx": DEFAULT_NUM_CTX})
     except node_manager.NoAvailableWorkerError as e:
+        if MASTER_OLLAMA_FALLBACK:
+            logger.warning(
+                "Cluster: semua Worker Node gagal (%s) -- mencoba fallback ke Ollama lokal di Master Node.", e
+            )
+            try:
+                return _call_local_ollama_chat(messages, model_name)
+            except AIEngineError:
+                # Ollama lokal di Master juga gagal (mis. model belum di-pull) --
+                # lempar error yang menyebut KEDUA jalur sudah dicoba, lebih
+                # informatif untuk user/owner dibanding hanya error cluster.
+                raise AIEngineError(
+                    str(e),
+                    "⚠️ Semua Worker Node AI sedang offline/sibuk, dan Ollama Fallback "
+                    "di Master Node juga gagal memproses. Coba lagi dalam beberapa saat.",
+                )
         logger.error("Cluster: tidak ada worker node tersedia: %s", e)
         raise AIEngineError(
             str(e),

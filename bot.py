@@ -37,7 +37,10 @@ import tempfile
 import traceback
 from typing import Optional
 
-from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, constants, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
+)
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -97,6 +100,29 @@ PIN_TAG_RE = re.compile(r"\[PIN\]", re.IGNORECASE)
 
 MAX_TELEGRAM_FILE_MB = 50  # batas file yang bisa diunduh bot lewat Bot API (server lokal bisa lebih besar)
 MAX_TELEGRAM_MSG_LEN = 4000  # sedikit di bawah batas Telegram 4096 agar ada ruang untuk formatting
+
+# --- Auto-Register Commands (muncul di menu "/" Telegram, kiri bawah kotak chat) ---
+# Didaftarkan sekali saat startup lewat application.bot.set_my_commands (lihat
+# _post_init_start_backup). Command admin didaftarkan TERPISAH dengan scope
+# BotCommandScopeChat(OWNER_ID) supaya HANYA muncul di menu owner -- user biasa
+# tidak melihat /gencode dkk di menu mereka sama sekali (tetap tertolak juga
+# secara otorisasi di masing-masing handler, ini murni soal kerapian UX menu).
+PUBLIC_COMMANDS = [
+    BotCommand("start", "Mulai & lihat cara pakai bot"),
+    BotCommand("help", "Bantuan & daftar perintah"),
+    BotCommand("status", "Lihat sisa kuota token & model aktif (profil)"),
+    BotCommand("model", "Pilih Role & Tier model AI"),
+    BotCommand("redeem", "Tukar kode redeem"),
+    BotCommand("reset", "Hapus riwayat chat, mulai baru"),
+]
+OWNER_COMMANDS = PUBLIC_COMMANDS + [
+    BotCommand("gencode", "[Owner] Buat kode redeem baru"),
+    BotCommand("codes", "[Owner] Lihat kode redeem belum dipakai"),
+    BotCommand("users", "[Owner] Lihat daftar user"),
+    BotCommand("ban", "[Owner] Nonaktifkan akses user"),
+    BotCommand("unban", "[Owner] Aktifkan kembali akses user"),
+    BotCommand("broadcast", "[Owner] Kirim pesan ke semua user"),
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -263,6 +289,76 @@ async def _send_as_document(update: Update, text: str, caption: str) -> None:
         os.remove(tmp_path)
 
 
+# =========================================================================
+# FEEDBACK VISUAL: EDIT PESAN BERKALA SAAT AI SEDANG MEMPROSES
+# =========================================================================
+# Untuk proses panjang (chat & ekstraksi file), user melihat SATU pesan yang
+# isinya berganti secara berkala ("Membaca konteks..." -> "Menyusun jawaban...")
+# alih-alih pesan "sedang mengetik" yang statis. Diimplementasikan sebagai
+# task asyncio terpisah yang berjalan PARALEL dengan pemrosesan sebenarnya
+# (asyncio.to_thread ke ai_engine), bukan menyisipkan callback ke ai_engine --
+# ai_engine.py sengaja tetap sinkron & tidak perlu tahu apa pun soal Telegram.
+
+PROGRESS_STAGES = [
+    (0, "🧠 Membaca konteks percakapan..."),
+    (4, "🔎 Menyusun jawaban..."),
+    (8, "⏳ Model sedang berpikir lebih dalam (pertanyaan/berkas ini cukup kompleks)..."),
+    (18, "⏳ Masih diproses, mohon tunggu (model besar bisa makan waktu beberapa menit)..."),
+]
+
+
+class ProgressReporter:
+    """
+    Context manager async: mengirim 1 pesan lalu mengeditnya secara berkala
+    mengikuti PROGRESS_STAGES selama blok `async with` berjalan. Pesan
+    progres otomatis dihapus begitu blok selesai (baik sukses maupun error)
+    supaya tidak menyampah histori chat -- balasan asli AI dikirim terpisah
+    lewat deliver_ai_reply seperti biasa.
+
+    Semua error Telegram (rate limit, pesan dihapus manual oleh user, dll)
+    ditelan diam-diam di sini -- progres visual adalah "nice to have", tidak
+    boleh sampai membuat proses utama (chat/file) gagal gara-gara gagal edit.
+    """
+
+    def __init__(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self._chat_id = update.effective_chat.id
+        self._bot = context.bot
+        self._message = None
+        self._task: Optional[asyncio.Task] = None
+
+    async def __aenter__(self) -> "ProgressReporter":
+        try:
+            self._message = await self._bot.send_message(self._chat_id, PROGRESS_STAGES[0][1])
+        except TelegramError as e:
+            logger.debug("ProgressReporter: gagal kirim pesan progres awal: %s", e)
+            self._message = None
+        if self._message is not None:
+            self._task = asyncio.create_task(self._run())
+        return self
+
+    async def _run(self) -> None:
+        try:
+            for delay_sec, text in PROGRESS_STAGES[1:]:
+                await asyncio.sleep(delay_sec)  # jeda relatif sejak tahap sebelumnya
+                try:
+                    await self._message.edit_text(text)
+                except BadRequest:
+                    pass  # isi identik/pesan sudah dihapus -- aman diabaikan
+                except TelegramError as e:
+                    logger.debug("ProgressReporter: gagal edit pesan progres: %s", e)
+        except asyncio.CancelledError:
+            pass
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._task is not None:
+            self._task.cancel()
+        if self._message is not None:
+            try:
+                await self._message.delete()
+            except TelegramError:
+                pass  # user mungkin sudah menghapusnya manual, atau sudah kedaluwarsa
+
+
 async def deliver_ai_reply(update: Update, reply_text: str) -> None:
     """
     Menangani fleksibilitas respons AI:
@@ -354,6 +450,20 @@ async def github_auto_backup_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _post_init_start_backup(application: Application) -> None:
+    # --- Auto-Register Commands ke menu Telegram ("/" di kiri bawah kotak chat) ---
+    # Scope default (PUBLIC_COMMANDS) berlaku untuk semua user; scope khusus
+    # OWNER_ID (OWNER_COMMANDS, superset yang menyertakan command admin) HANYA
+    # berlaku di chat pribadi owner dengan bot. Kegagalan di sini (mis. Telegram
+    # API sedang bermasalah) tidak boleh menghentikan bot start, jadi dibungkus
+    # try/except dan hanya di-log sebagai warning.
+    try:
+        await application.bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
+        await application.bot.set_my_commands(OWNER_COMMANDS, scope=BotCommandScopeChat(OWNER_ID))
+        logger.info("Menu command Telegram berhasil didaftarkan (%d publik, %d untuk owner).",
+                    len(PUBLIC_COMMANDS), len(OWNER_COMMANDS))
+    except TelegramError as e:
+        logger.warning("Gagal mendaftarkan menu command ke Telegram (bot tetap jalan normal): %s", e)
+
     if not (GH_BACKUP_ENABLED and GH_BACKUP_PAT and GH_BACKUP_REPO):
         logger.info(
             "GH backup: dinonaktifkan (GH_BACKUP_ENABLED != true, atau PAT/repo belum diset)."
@@ -867,8 +977,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # Panggilan ke Ollama bisa memakan waktu sampai 10 menit (timeout 600s).
         # Dijalankan di thread terpisah agar event loop bot TIDAK terblokir/hang
-        # dan user lain tetap bisa dilayani secara bersamaan.
-        result = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name, role)
+        # dan user lain tetap bisa dilayani secara bersamaan. ProgressReporter
+        # mengedit satu pesan secara berkala selama menunggu (feedback visual).
+        async with ProgressReporter(update, context):
+            result = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name, role)
 
         reply_text = result["content"]
         db.save_message(token, "assistant", reply_text)
@@ -924,7 +1036,8 @@ async def _process_and_reply_file(
     try:
         # Ekstraksi/analisis file (termasuk panggilan vision) juga bisa memakan waktu lama
         # (video/ZIP besar), jalankan di thread terpisah agar bot tetap responsif.
-        result = await asyncio.to_thread(engine.process_uploaded_file, filename, content)
+        async with ProgressReporter(update, context):
+            result = await asyncio.to_thread(engine.process_uploaded_file, filename, content)
         extracted_text = result["extracted_text"]
 
         caption = (message.caption or "").strip()
@@ -942,7 +1055,8 @@ async def _process_and_reply_file(
         previous_history = db.get_history(token, limit=engine.MAX_HISTORY_MESSAGES)
         db.save_message(token, "user", user_message)
 
-        result_chat = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name, role)
+        async with ProgressReporter(update, context):
+            result_chat = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name, role)
         reply_text = result_chat["content"]
 
         db.save_message(token, "assistant", reply_text)

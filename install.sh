@@ -178,6 +178,43 @@ install_ollama_if_needed() {
   echo ""
 }
 
+# ---------------------------------------------------------------------------
+# RESOURCE LIMIT OLLAMA (cgroups v2, 70% CPU + 70% RAM) - lihat ollama-limit.conf
+# ---------------------------------------------------------------------------
+# Dipanggil setelah Ollama diinstall di server yang JUGA menjalankan proses lain
+# (Bot/Dashboard) -- yaitu mode Single-Server ([1]) dan mode Master Node dengan
+# opsi "Ollama Fallback" diaktifkan ([3]). TIDAK dipanggil di Worker Node murni
+# ([4]) karena Worker Node memang didedikasikan penuh untuk Ollama saja, jadi
+# tidak perlu dibatasi (justru ingin memakai semua resource yang ada).
+apply_ollama_resource_limit() {
+  log_info "Menerapkan batas resource Ollama (maks 70% CPU & 70% RAM) agar Bot/Dashboard tidak crash/OOM..."
+
+  local cpu_cores mem_total_kb mem_max_kb mem_high_kb cpu_quota_percent
+
+  cpu_cores="$(nproc)"
+  cpu_quota_percent=$(( cpu_cores * 70 ))
+
+  mem_total_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+  mem_max_kb=$(( mem_total_kb * 70 / 100 ))
+  mem_high_kb=$(( mem_total_kb * 63 / 100 ))  # ~90% dari MemoryMax, sebagai soft-limit
+
+  mkdir -p /etc/systemd/system/ollama.service.d
+  cat > /etc/systemd/system/ollama.service.d/limit.conf <<EOF
+# File ini di-generate otomatis oleh install.sh — lihat ollama-limit.conf di
+# repo untuk penjelasan lengkap tiap opsi. Aman ditimpa ulang saat re-install.
+[Service]
+CPUQuota=${cpu_quota_percent}%
+MemoryMax=${mem_max_kb}K
+MemoryHigh=${mem_high_kb}K
+OOMScoreAdjust=500
+EOF
+
+  systemctl daemon-reload
+  systemctl restart ollama
+  log_success "Batas resource Ollama aktif: CPUQuota=${cpu_quota_percent}% (${cpu_cores} core terdeteksi), MemoryMax=$(( mem_max_kb / 1024 ))MB."
+  echo ""
+}
+
 pull_all_models() {
   # ollama pull idempotent: jika model sudah ada & up-to-date, hanya diverifikasi (cepat).
   for model in "${ALL_MODELS[@]}"; do
@@ -550,6 +587,7 @@ run_update_flow() {
 
   migrate_database
   pull_all_models
+  apply_ollama_resource_limit
 
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
   chmod 600 "${ENV_FILE}"
@@ -570,8 +608,7 @@ run_fresh_install_flow() {
   install_system_dependencies
   install_ollama_if_needed
   pull_all_models
-
-  # SETUP USER SISTEM UNTUK MENJALANKAN SERVICE (least privilege)
+  apply_ollama_resource_limit
   if id "${SERVICE_USER}" &>/dev/null; then
     log_warn "User sistem '${SERVICE_USER}' sudah ada."
   else
@@ -844,8 +881,25 @@ install_master_node_flow() {
   echo ""
   echo -e "Master Node menjalankan: Telegram Bot, Load Balancer (node_manager.py),"
   echo -e "Web Dashboard (status publik + admin), dan database SQLite."
-  echo -e "${YELLOW}Ollama TIDAK diinstall di sini${NC} -- AI generation dijalankan oleh"
-  echo -e "Worker Node yang Anda daftarkan lewat Admin Dashboard nanti."
+  echo -e "${YELLOW}Secara default, Ollama TIDAK diinstall di sini${NC} -- AI generation"
+  echo -e "dijalankan oleh Worker Node yang Anda daftarkan lewat Admin Dashboard nanti."
+  echo ""
+  echo -e "${BOLD}--- Opsi: Ollama Fallback di Master Node (opsional) ---${NC}"
+  echo -e "Jika diaktifkan, Master Node JUGA menjalankan Ollama secara lokal sebagai"
+  echo -e "cadangan -- ai_engine.py akan otomatis memakainya HANYA jika semua Worker"
+  echo -e "Node di cluster sedang offline/tidak tersedia (lihat node_manager.generate)."
+  echo -e "${YELLOW}Resource Ollama otomatis dibatasi maksimal 70% CPU & 70% RAM${NC}"
+  echo -e "(lihat ollama-limit.conf) agar Bot/Dashboard tetap stabil dan tidak OOM."
+  echo ""
+  read -r -p "Aktifkan Ollama Fallback di Master Node ini? [y/N]: " OLLAMA_FALLBACK_INPUT < "${TTY_IN}"
+  OLLAMA_FALLBACK_INPUT="${OLLAMA_FALLBACK_INPUT:-n}"
+  if [[ "${OLLAMA_FALLBACK_INPUT,,}" == "y" || "${OLLAMA_FALLBACK_INPUT,,}" == "yes" ]]; then
+    MASTER_OLLAMA_FALLBACK="true"
+    log_info "Ollama Fallback AKAN diinstall & dibatasi 70% CPU/RAM di Master Node ini."
+  else
+    MASTER_OLLAMA_FALLBACK="false"
+    log_info "Ollama Fallback dilewati -- Master Node murni Bot+DB+Dashboard (default)."
+  fi
   echo ""
 
   install_system_dependencies
@@ -924,6 +978,7 @@ install_master_node_flow() {
 TELEGRAM_BOT_TOKEN=${BOT_TOKEN_INPUT}
 OWNER_TELEGRAM_ID=${OWNER_ID_INPUT}
 CLUSTER_MODE=master
+MASTER_OLLAMA_FALLBACK=${MASTER_OLLAMA_FALLBACK}
 ADMIN_USERNAME=${ADMIN_USERNAME_INPUT}
 ADMIN_PASSWORD=${ADMIN_PASSWORD_INPUT}
 DASHBOARD_PORT=${DASHBOARD_PORT_INPUT}
@@ -942,6 +997,13 @@ EOF
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
 
   migrate_database
+
+  if [[ "${MASTER_OLLAMA_FALLBACK}" == "true" ]]; then
+    log_info "Menginstall Ollama sebagai Fallback di Master Node (opsi diaktifkan)..."
+    install_ollama_if_needed
+    pull_all_models
+    apply_ollama_resource_limit
+  fi
 
   log_info "Memvalidasi instalasi Master (import check)..."
   if "${VENV_DIR}/bin/python3" -c "

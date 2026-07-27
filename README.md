@@ -8,16 +8,29 @@ hingga masa berlaku tertentu. Dilengkapi proteksi anti-jailbreak bawaan untuk
 menjaga model tetap pada persona & aturannya.
 
 ## Isi Paket
+
+**Single-Server / Master Node:**
 - `bot.py`            — Bot Telegram utama (polling, python-telegram-bot)
 - `ai_engine.py`      — Logika inti: ekstraksi file, panggilan ke Ollama (chat & vision)
-- `database.py`       — Layer SQLite: riwayat chat, data user, limit, kode redeem
+- `database.py`       — Layer SQLite: riwayat chat, data user, limit, kode redeem, registry cluster
 - `github_backup.py`  — Backup & restore database ke GitHub lewat REST API (lihat bagian di bawah)
-- `install.sh`        — Installer otomatis (curl | sudo bash)
+- `master_dashboard.py` — Web Dashboard (FastAPI): status publik cluster + Admin Panel CRUD Worker Node
+- `node_manager.py`   — Load Balancer & health-check Worker Node (hanya aktif di Master Node)
+
+**Worker Node** (Distributed Cluster Architecture, opsional):
+- `worker_agent.py`   — Agent FastAPI ringan yang menjembatani Master ↔ Ollama lokal di tiap Worker
+
+**Deployment:**
+- `install.sh`        — Installer utama (menu interaktif: Single-Server / Update / Master / Worker)
+- `update.sh`         — Smart Updater mandiri (git pull tanpa menimpa `.env`/database/SSL)
+- `motd_setup.sh`      — Pasang SSH Welcome Banner (status Bot/Ollama/CPU/RAM saat login)
+- `ollama-limit.conf` — Referensi systemd drop-in (cgroups, batas 70% CPU/RAM untuk Ollama)
 
 ## Cara Deploy
-1. Upload kelima file di atas ke repo GitHub Anda (ini repo *source code*, terpisah
+1. Upload semua file di atas ke repo GitHub Anda (ini repo *source code*, terpisah
    dari repo backup database di bagian "Backup Database ke GitHub" di bawah).
-2. Edit `install.sh`, ganti `REPO_GIT_URL` di bagian atas file dengan URL repo Anda.
+2. Edit `install.sh` **dan** `update.sh`, ganti `REPO_GIT_URL` di bagian atas
+   masing-masing file dengan URL repo Anda (harus sama persis di keduanya).
 3. Siapkan dua hal dari Telegram sebelum instalasi:
    - **Token Bot** dari [@BotFather](https://t.me/BotFather) (perintah `/newbot`)
    - **ID Telegram Owner** dari [@userinfobot](https://t.me/userinfobot) (kirim pesan apa
@@ -26,9 +39,18 @@ menjaga model tetap pada persona & aturannya.
    ```
    curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/install.sh | sudo bash
    ```
-5. Installer akan meminta Token Bot dan ID Owner di tengah proses instalasi, lalu
+5. Installer menampilkan menu interaktif — pilih **[1] Install Baru (Single-Server)**
+   untuk 1 VPS yang menjalankan Ollama & Bot sekaligus (paling sederhana), atau **[3]/[4]**
+   jika ingin arsitektur cluster Master/Worker (lihat bagian "Arsitektur Cluster" di bawah).
+6. Installer akan meminta Token Bot dan ID Owner di tengah proses instalasi, lalu
    otomatis menyimpannya ke `/opt/ai-bot/.env` (chmod 600) — TIDAK ADA di source code.
-6. Setelah instalasi selesai, buka Telegram dan kirim `/start` ke bot Anda.
+7. (Opsional) Pasang SSH Welcome Banner agar status Bot/Ollama/CPU/RAM tampil
+   otomatis saat login SSH ke server:
+   ```
+   sudo bash motd_setup.sh
+   ```
+8. Setelah instalasi selesai, buka Telegram dan kirim `/start` ke bot Anda — daftar
+   perintah juga otomatis muncul di menu "/" Telegram (kiri bawah kotak chat).
 
 Bot berjalan mode **polling**, jadi tidak butuh domain, SSL/certbot, maupun Nginx —
 cukup koneksi internet keluar dari VPS ke server Telegram.
@@ -84,6 +106,17 @@ cukup koneksi internet keluar dari VPS ke server Telegram.
 | `/unban <id>` | Aktifkan kembali akses user |
 | `/broadcast <pesan>` | Kirim pesan ke semua user terdaftar |
 
+Semua perintah di atas otomatis terdaftar ke menu **"/"** Telegram (kiri bawah kotak
+chat) saat bot startup — user cukup ketik `/` untuk melihat daftar lengkap tanpa
+perlu mengetik manual. Menu owner (termasuk command admin) hanya muncul khusus di
+chat pribadi `OWNER_TELEGRAM_ID` dengan bot, tidak terlihat oleh user lain.
+
+**Feedback visual saat AI berpikir:** untuk chat maupun upload file, bot mengirim
+satu pesan status yang diperbarui secara berkala ("🧠 Membaca konteks..." → "🔎
+Menyusun jawaban..." → dst. mengikuti durasi proses), lalu otomatis terhapus begitu
+jawaban asli terkirim — memberi kepastian visual bahwa bot masih bekerja, terutama
+untuk model besar/berkas panjang yang bisa memakan waktu beberapa menit.
+
 ## Fitur Upload
 
 Kirim file langsung ke bot (sebagai dokumen, foto, atau video Telegram):
@@ -133,6 +166,63 @@ database berjalan **otomatis dan aman**:
 - Cukup jalankan ulang `install.sh` (mode Update) di server yang sudah ada,
   migrasi kolom akan otomatis dijalankan sebelum service di-restart.
 
+## Arsitektur Cluster (Master-Worker, Opsional)
+
+Selain mode **Single-Server** (1 VPS menjalankan semuanya, cara paling sederhana),
+bot ini juga mendukung **Distributed Cluster Architecture** untuk menyebar beban
+inferensi AI ke beberapa VPS sekaligus:
+
+- **Master Node** — menjalankan Telegram Bot, Load Balancer (`node_manager.py`),
+  Web Dashboard (`master_dashboard.py`), dan database SQLite. Secara default
+  **tidak** menjalankan Ollama sendiri.
+- **Worker Node** — VPS terpisah yang HANYA menjalankan Ollama + `worker_agent.py`
+  (agent ringan di port `3716`). Bisa didaftarkan sebanyak apa pun ke Master lewat
+  Admin Dashboard, tanpa perlu restart Bot Telegram.
+- **Load Balancing "Least Loaded"** — tiap request AI dirutekan ke Worker Node
+  dengan `active_tasks` paling sedikit (tie-break: CPU lalu RAM lebih rendah),
+  dengan failover otomatis ke Worker Node berikutnya jika node yang dipilih gagal.
+- **Ollama Fallback di Master Node (opsional)** — saat memilih **[3] Install
+  Master Node** di `install.sh`, ada opsi tambahan untuk JUGA menjalankan Ollama
+  lokal di Master sebagai cadangan terakhir, dipakai HANYA jika **semua** Worker
+  Node di cluster sedang offline/tidak tersedia. Nonaktif secara default. Jika
+  diaktifkan, Ollama otomatis dibatasi maksimal **70% CPU & 70% RAM** (lihat
+  `ollama-limit.conf`) supaya Bot & Dashboard di server yang sama tetap stabil.
+
+**Cara deploy cluster:**
+1. Jalankan `install.sh` di VPS pertama, pilih **[3] Install MASTER NODE**.
+2. Jalankan `install.sh` di tiap VPS Worker, pilih **[4] Install WORKER NODE**
+   — installer akan menampilkan API Key unik untuk node tsb.
+3. Buka `http://<ip-master>:8080/admin` (kredensial sesuai yang diisi saat
+   instalasi Master), tambahkan tiap Worker Node (nama, IP, port, API Key).
+4. Status cluster publik bisa dilihat di `http://<ip-master>:8080/` (tanpa login,
+   IP Worker Node disamarkan demi keamanan).
+
+## Update & Maintenance Server
+
+**Update source code** (aman, tidak menyentuh `.env`/database/sertifikat SSL):
+```
+curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/update.sh | sudo bash
+```
+Script ini otomatis mendeteksi instalasi yang ada (Single-Server/Master di
+`/opt/ai-bot`, Worker di `/opt/ai-worker`), menjalankan `git pull`, migrasi
+database (idempotent), lalu merestart service yang relevan — tanpa perlu mengisi
+ulang Token Bot, ID Owner, atau konfigurasi lain yang sudah ada.
+
+**SSH Welcome Banner** — menampilkan status Bot/Dashboard/Worker Agent/Ollama
+serta CPU/RAM/Disk setiap kali login SSH ke server:
+```
+sudo bash motd_setup.sh
+```
+Dipasang ke `/etc/profile.d/` (berlaku untuk semua user, bukan hanya satu akun).
+Lepas dengan `sudo rm /etc/profile.d/99-ai-bot-banner.sh`.
+
+**Batas resource Ollama** (`ollama-limit.conf`) — di mode Single-Server, batas
+70% CPU & 70% RAM untuk Ollama diterapkan **otomatis** oleh `install.sh` (dihitung
+sesuai jumlah core & RAM fisik server saat itu). Untuk mengecek batas yang aktif:
+```
+systemctl show ollama --property=CPUQuotaPerSecUSec,MemoryMax,MemoryHigh
+```
+
 ## Backup Database ke GitHub (Opsional)
 
 Database (`bot_data.db`) bisa di-backup otomatis ke repo GitHub terpisah, supaya
@@ -159,9 +249,15 @@ riwayat chat & user tetap aman walau server hilang/di-reset.
   `OWNER_TELEGRAM_ID`) — bot menolak start jika tidak diset.
 - Rahasia disimpan di `/opt/ai-bot/.env` (chmod 600), dimuat oleh systemd `EnvironmentFile=`.
 - Bot jalan sebagai user sistem non-root (`aibot`) dengan systemd hardening
-  (`ProtectSystem=strict`, `NoNewPrivileges=true`, dll).
+  (`ProtectSystem=strict`, `NoNewPrivileges=true`, dll). Worker Node (`aiworker`)
+  memakai hardening yang sama di service `ai-worker-agent`.
 - Hanya `OWNER_TELEGRAM_ID` yang bisa memakai command admin (`/gencode`, `/users`,
-  `/ban`, `/broadcast`, dll) — command ini ditolak otomatis untuk user lain.
+  `/ban`, `/broadcast`, dll) — command ini ditolak otomatis untuk user lain, dan
+  menu commandnya pun hanya terdaftar di chat pribadi owner (lihat "Perintah Bot").
+- Komunikasi Master ↔ Worker Node diautentikasi lewat header `X-API-KEY` unik
+  per node; Admin Dashboard (`/admin`) dilindungi HTTP Basic Auth (`ADMIN_USERNAME`/
+  `ADMIN_PASSWORD`), dan API Key Worker Node tidak pernah ditampilkan penuh di UI
+  (hanya 4 karakter terakhir).
 
 ## Mengganti Token Bot / ID Owner
 ```
