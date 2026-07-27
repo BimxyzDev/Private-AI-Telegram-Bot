@@ -127,6 +127,25 @@ def stop_health_check_loop() -> None:
     _stop_event.set()
 
 
+def _node_supports_model(node: Dict[str, Any], model_name: str) -> bool:
+    """True jika node diketahui punya model tsb. Data kosong dianggap unknown, bukan deny."""
+    raw_models = node.get("models_available")
+    if not raw_models:
+        return True
+
+    models = raw_models
+    if isinstance(raw_models, str):
+        try:
+            models = json.loads(raw_models)
+        except (TypeError, ValueError):
+            return True
+
+    if not isinstance(models, list):
+        return True
+
+    return model_name in models
+
+
 # =========================================================================
 # LOAD BALANCING: PILIH NODE PALING SEDIKIT BEBAN ("Least Loaded")
 # =========================================================================
@@ -139,10 +158,12 @@ def _score(node: Dict[str, Any]) -> tuple:
     return (active, cpu, ram)
 
 
-def get_candidate_nodes() -> List[Dict[str, Any]]:
+def get_candidate_nodes(model_name: Optional[str] = None) -> List[Dict[str, Any]]:
     """Daftar node online (enabled + status='online'), diurutkan dari paling sedikit beban."""
     nodes = db.list_worker_nodes(enabled_only=True)
     online = [n for n in nodes if n.get("status") == "online"]
+    if model_name:
+        online = [n for n in online if _node_supports_model(n, model_name)]
     online.sort(key=_score)
     return online
 
@@ -177,10 +198,11 @@ def generate(
     Return dict senada dengan ai_engine.call_ollama_chat:
       {"content", "prompt_tokens", "completion_tokens", "total_tokens"}
     """
-    candidates = get_candidate_nodes()
+    candidates = get_candidate_nodes(model_name)
     if not candidates:
         raise NoAvailableWorkerError(
-            "Tidak ada Worker Node yang online saat ini. Cek status cluster di Admin Dashboard."
+            f"Tidak ada Worker Node online yang siap menjalankan model '{model_name}'. "
+            "Cek model yang terpasang di worker atau pilih tier yang lebih ringan di /model."
         )
 
     mode = "generate" if prompt is not None else "chat"

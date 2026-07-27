@@ -392,6 +392,82 @@ def resolve_model(role: Optional[str], tier: Optional[str]) -> str:
     return tiers_for_role[tier]
 
 
+# Cache daftar model lokal agar request /api/tags tidak dipanggil terus-menerus.
+_LOCAL_MODEL_CACHE: Optional[set[str]] = None
+MODEL_PULL_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_PULL_TIMEOUT", "1800"))
+
+
+def _refresh_local_model_cache() -> set[str]:
+    """Ambil ulang daftar model lokal dari Ollama dan simpan ke cache proses."""
+    global _LOCAL_MODEL_CACHE
+    url = f"{OLLAMA_HOST}/api/tags"
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json() if resp.content else {}
+        models = {
+            item.get("name")
+            for item in data.get("models", [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        _LOCAL_MODEL_CACHE = models
+        return models
+    except Exception as exc:
+        logger.warning("Gagal membaca daftar model lokal dari Ollama (%s): %s", url, exc)
+        if _LOCAL_MODEL_CACHE is None:
+            _LOCAL_MODEL_CACHE = set()
+        return _LOCAL_MODEL_CACHE
+
+
+def ensure_model_ready(model_name: str, auto_pull: bool = True) -> bool:
+    """Pastikan model tersedia secara lokal; jika belum ada, pull otomatis."""
+    local_models = _refresh_local_model_cache()
+    if model_name in local_models:
+        return True
+
+    if not auto_pull:
+        return False
+
+    if shutil.which("ollama") is None:
+        raise AIEngineError(
+            f"Ollama CLI tidak tersedia saat mencoba memuat model {model_name}.",
+            f"Model '{model_name}' belum tersedia dan Ollama CLI tidak ditemukan untuk auto-pull.",
+        )
+
+    try:
+        pull_proc = subprocess.run(
+            ["ollama", "pull", model_name],
+            capture_output=True,
+            text=True,
+            timeout=MODEL_PULL_TIMEOUT_SECONDS if MODEL_PULL_TIMEOUT_SECONDS > 0 else None,
+        )
+    except subprocess.TimeoutExpired:
+        raise AIEngineError(
+            f"Auto-pull model '{model_name}' timeout.",
+            f"Auto-pull model '{model_name}' melebihi batas waktu. Coba lagi nanti.",
+        )
+    except Exception as exc:
+        raise AIEngineError(
+            str(exc),
+            f"Gagal menjalankan auto-pull untuk model '{model_name}'.",
+        )
+
+    if pull_proc.returncode != 0:
+        stderr = (pull_proc.stderr or "").strip()
+        stdout = (pull_proc.stdout or "").strip()
+        detail = stderr or stdout or f"ollama pull {model_name} gagal"
+        raise AIEngineError(
+            detail,
+            f"Auto-pull model '{model_name}' gagal. Detail: {detail[:200]}",
+        )
+
+    # Refresh cache setelah pull sukses agar request berikutnya langsung lolos.
+    local_models = _refresh_local_model_cache()
+    if model_name not in local_models:
+        logger.warning("Model '%s' selesai dipull tetapi belum muncul di daftar lokal.", model_name)
+    return True
+
+
 def build_system_prompt(role: Optional[str]) -> str:
     """Menggabungkan personality prompt sesuai role + lapisan keamanan anti-jailbreak tetap."""
     if role not in ROLE_SYSTEM_PROMPTS:
@@ -523,6 +599,7 @@ def _call_cluster_vision(image_b64: str, prompt: str) -> str:
 
 
 def _call_local_ollama_vision(image_b64: str, prompt: str) -> str:
+    ensure_model_ready(OLLAMA_VISION_MODEL)
     url = f"{OLLAMA_HOST}/api/generate"
 
     payload = {
@@ -820,6 +897,7 @@ def call_ollama_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
 
 def _call_local_ollama_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
     """Mode 'standalone': panggil Ollama lokal langsung (perilaku versi single-server)."""
+    ensure_model_ready(model_name)
     url = f"{OLLAMA_HOST}/api/chat"
     payload = {
         "model": model_name,

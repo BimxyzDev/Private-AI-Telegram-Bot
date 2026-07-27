@@ -136,15 +136,16 @@ def model_full_label(role: str, tier: str) -> str:
     role_label = engine.ROLE_LABELS.get(role, role)
     tier_label = engine.TIER_SHORT_LABELS.get(tier, tier)
     model_name = engine.resolve_model(role, tier)
-    return f"{role_label} · {tier_label} ({model_name})"
+    lock_suffix = " 🔒" if _model_lock_reason(role, tier) else ""
+    return f"{role_label} · {tier_label} ({model_name}){lock_suffix}"
 
 
 def model_short_label(role: str, tier: str) -> str:
     """Label pendek 'Role · Tier' dipakai di /users (ringkasan admin)."""
     role_label = engine.ROLE_LABELS.get(role, role)
     tier_label = engine.TIER_SHORT_LABELS.get(tier, tier)
-    return f"{role_label} · {tier_label}"
-
+    lock_suffix = " 🔒" if _model_lock_reason(role, tier) else ""
+    return f"{role_label} · {tier_label}{lock_suffix}"
 GPU_DISABLED_IMAGE_MESSAGE = (
     "⚠️ Maaf, server saat ini berjalan tanpa GPU (CPU-Only). Fitur analisis gambar "
     "dinonaktifkan demi menjaga stabilitas server."
@@ -207,14 +208,145 @@ def subprocess_run_nvidia_smi() -> bool:
     return proc.returncode == 0
 
 
+def detect_gpu_profile() -> dict:
+    """Mendeteksi GPU + perkiraan VRAM agar tier berat bisa dikunci dengan aman."""
+    profile = {
+        "has_gpu": False,
+        "backend": None,
+        "gpu_count": 0,
+        "max_vram_gb": 0.0,
+    }
+
+    try:
+        if subprocess_run_nvidia_smi():
+            mem_query = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if mem_query.returncode == 0:
+                values = []
+                for line in mem_query.stdout.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        values.append(float(line) / 1024.0)
+                    except ValueError:
+                        continue
+                if values:
+                    profile.update(
+                        {
+                            "has_gpu": True,
+                            "backend": "nvidia-smi",
+                            "gpu_count": len(values),
+                            "max_vram_gb": max(values),
+                        }
+                    )
+                    return profile
+    except Exception as e:
+        logger.debug("Deteksi GPU via nvidia-smi gagal/tidak tersedia: %s", e)
+
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            values = []
+            for idx in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(idx)
+                values.append(props.total_memory / (1024 ** 3))
+            if values:
+                profile.update(
+                    {
+                        "has_gpu": True,
+                        "backend": "torch",
+                        "gpu_count": len(values),
+                        "max_vram_gb": max(values),
+                    }
+                )
+                return profile
+    except ImportError:
+        logger.debug("Library torch tidak terinstall, melewati pengecekan torch.cuda.is_available().")
+    except Exception as e:
+        logger.debug("Deteksi GPU via torch gagal: %s", e)
+
+    logger.warning(
+        "Tidak ada GPU terdeteksi (nvidia-smi maupun torch.cuda tidak tersedia/aktif). "
+        "Bot akan berjalan mode CPU-Only, fitur analisis gambar akan dinonaktifkan."
+    )
+    return profile
+
+
 # Dideteksi sekali saat modul di-load (startup bot). Dipakai sebagai guardrail
 # di handle_photo agar server CPU-only tidak dipaksa memproses request gambar
 # yang berat dan bisa mengganggu stabilitas (lihat GPU_DISABLED_IMAGE_MESSAGE).
-HAS_GPU: bool = detect_gpu()
+GPU_PROFILE: dict = detect_gpu_profile()
+HAS_GPU: bool = bool(GPU_PROFILE.get("has_gpu"))
+GPU_MAX_VRAM_GB: float = float(GPU_PROFILE.get("max_vram_gb") or 0.0)
 
 
 # =========================================================================
 # HELPER
+# Ambang VRAM konservatif untuk tier yang benar-benar berat.
+TIER_MIN_VRAM_GB = {
+    "heavy": 12.0,
+    "qwen_14b": 12.0,
+    "phi3_medium": 12.0,
+    "codellama_13b": 12.0,
+    "qwen_32b": 24.0,
+    "deepseek_r1_32b": 24.0,
+    "mixtral_8x7b": 24.0,
+    "gemma2_27b": 24.0,
+    "codellama_34b": 24.0,
+    "yi_34b": 24.0,
+    "llama31_70b": 48.0,
+    "qwen_72b": 48.0,
+    "deepseek_r1_70b": 48.0,
+    "llama3_405b": 96.0,
+}
+
+
+def _required_vram_gb(tier: str) -> float:
+    return float(TIER_MIN_VRAM_GB.get(tier, 0.0))
+
+
+def _model_lock_reason(role: str, tier: str) -> Optional[str]:
+    """Kembalikan alasan jika model harus dikunci karena hardware/cluster tidak cukup."""
+    model_name = engine.ROLE_TIERS.get(role, {}).get(tier)
+    if not model_name:
+        return "Model tidak valid."
+
+    if engine.CLUSTER_MODE == "master":
+        try:
+            import node_manager
+
+            candidates = node_manager.get_candidate_nodes(model_name)
+            if candidates:
+                return None
+            if not engine.MASTER_OLLAMA_FALLBACK:
+                return f"Model '{model_name}' belum tersedia di worker cluster saat ini."
+        except Exception as exc:
+            logger.debug("Gagal mengecek kandidat worker untuk model %s: %s", model_name, exc)
+
+    required_vram = _required_vram_gb(tier)
+    if required_vram <= 0:
+        return None
+
+    if not HAS_GPU:
+        return (
+            f"Model '{model_name}' dikunci karena server ini CPU-only. "
+            f"Butuh GPU minimal {required_vram:.0f} GB VRAM."
+        )
+
+    if GPU_MAX_VRAM_GB < required_vram:
+        return (
+            f"Model '{model_name}' dikunci karena GPU hanya {GPU_MAX_VRAM_GB:.0f} GB VRAM. "
+            f"Butuh minimal {required_vram:.0f} GB VRAM."
+        )
+
+    return None
+
 # =========================================================================
 
 def is_owner(telegram_id: int) -> bool:
@@ -517,6 +649,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =========================================================================
+def _tier_button_locked(role: str, tier: str) -> bool:
+    return _model_lock_reason(role, tier) is not None
+
+
 # COMMAND: /model - pilih Role (General/Coder) lalu Tier, lewat Inline Keyboard
 # =========================================================================
 # Alur (state disimpan di Telegram sendiri lewat callback_data, BUKAN di memori bot,
@@ -542,10 +678,14 @@ def _role_keyboard(current_role: str) -> InlineKeyboardMarkup:
 def _tier_keyboard(role: str, current_role: str, current_tier: str) -> InlineKeyboardMarkup:
     buttons = []
     for tier in engine.ROLE_TIER_ORDER[role]:
+        locked = _tier_button_locked(role, tier)
         label = f"{engine.TIER_SHORT_LABELS[tier]} ({engine.ROLE_TIERS[role][tier]})"
+        if locked:
+            label = f"🔒 {label}"
         if role == current_role and tier == current_tier:
             label += " ✅"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"model_tier:{role}:{tier}")])
+        callback_data = f"model_lock:{role}:{tier}" if locked else f"model_tier:{role}:{tier}"
+        buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
     buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="model_back")])
     return InlineKeyboardMarkup(buttons)
 
@@ -567,11 +707,15 @@ def _tier_select_text(role: str, current_role: str, current_tier: str) -> str:
         tier_label = engine.TIER_SHORT_LABELS[tier]
         desc = engine.TIER_DESCRIPTIONS[tier]
         multiplier = engine.TOKEN_MULTIPLIER[tier]
-        lines.append(f"{tier_label} — `{model_name}`\n   {desc} Kuota token x{multiplier}.\n")
+        locked = _tier_button_locked(role, tier)
+        status = "🔒 Terkunci" if locked else f"Kuota token x{multiplier}."
+        if locked:
+            reason = _model_lock_reason(role, tier)
+            if reason:
+                status = f"🔒 Terkunci — {reason}"
+        lines.append(f"{tier_label} — `{model_name}`\n   {desc} {status}\n")
     lines.append(f"Model aktif kamu saat ini: *{model_full_label(current_role, current_tier)}*")
     return "\n".join(lines)
-
-
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     u = db.get_or_create_user(user.id, user.username)
@@ -608,6 +752,36 @@ async def callback_model_role(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
 
+async def callback_model_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback untuk tier yang terkunci. Hanya tampilkan alasan, jangan ubah model."""
+    query = update.callback_query
+    payload = (query.data or "").split(":")
+    if len(payload) != 3:
+        await query.answer("❌ Data tombol tidak valid.", show_alert=True)
+        return
+    _, role, tier = payload
+    reason = _model_lock_reason(role, tier)
+    if not reason:
+        await query.answer("Model ini tidak terkunci.", show_alert=False)
+        return
+    await query.answer(f"🔒 {reason}", show_alert=True)
+
+
+async def callback_model_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback untuk tier yang terkunci. Hanya tampilkan alasan, jangan ubah model."""
+    query = update.callback_query
+    payload = (query.data or "").split(":")
+    if len(payload) != 3:
+        await query.answer("❌ Data tombol tidak valid.", show_alert=True)
+        return
+    _, role, tier = payload
+    reason = _model_lock_reason(role, tier)
+    if not reason:
+        await query.answer("Model ini tidak terkunci.", show_alert=False)
+        return
+    await query.answer(f"🔒 {reason}", show_alert=True)
+
+
 async def callback_model_tier(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Langkah 2: user memilih tier di dalam role yang sudah dipilih -> terapkan."""
     query = update.callback_query
@@ -630,6 +804,29 @@ async def callback_model_tier(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer(f"❌ Tier '{tier}' tidak tersedia untuk role ini.", show_alert=True)
         return
 
+    reason = _model_lock_reason(role, tier)
+    if reason:
+        await query.answer(f"🔒 {reason}", show_alert=True)
+        return
+
+    model_name = engine.ROLE_TIERS[role][tier]
+    needs_local_pull = engine.CLUSTER_MODE != "master"
+    if engine.CLUSTER_MODE == "master":
+        try:
+            import node_manager
+
+            needs_local_pull = not node_manager.get_candidate_nodes(model_name) and engine.MASTER_OLLAMA_FALLBACK
+        except Exception as exc:
+            logger.debug("Gagal cek kandidat worker saat memilih model %s: %s", model_name, exc)
+            needs_local_pull = engine.MASTER_OLLAMA_FALLBACK
+
+    if needs_local_pull:
+        try:
+            await asyncio.to_thread(engine.ensure_model_ready, model_name)
+        except engine.AIEngineError as exc:
+            await query.answer(f"❌ {exc.user_message}", show_alert=True)
+            return
+
     db.get_or_create_user(user.id, user.username)
     db.set_model_role_tier(user.id, role, tier)
 
@@ -644,8 +841,42 @@ async def callback_model_tier(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     except TelegramError:
         pass
+    except TelegramError:
+        pass
 
 
+async def callback_model_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tombol '⬅️ Kembali' di layar tier -> kembali ke layar pilih role."""
+    query = update.callback_query
+    user = query.from_user
+    u = db.get_or_create_user(user.id, user.username)
+    current_role, current_tier = u["model_role"], u["model_tier"]
+
+    await query.answer()
+    try:
+        await query.edit_message_text(
+            _role_select_text(current_role, current_tier),
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=_role_keyboard(current_role),
+        )
+    except TelegramError:
+        pass
+async def callback_model_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tombol '⬅️ Kembali' di layar tier -> kembali ke layar pilih role."""
+    query = update.callback_query
+    user = query.from_user
+    u = db.get_or_create_user(user.id, user.username)
+    current_role, current_tier = u["model_role"], u["model_tier"]
+
+    await query.answer()
+    try:
+        await query.edit_message_text(
+            _role_select_text(current_role, current_tier),
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=_role_keyboard(current_role),
+        )
+    except TelegramError:
+        pass
 async def callback_model_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Tombol '⬅️ Kembali' di layar tier -> kembali ke layar pilih role."""
     query = update.callback_query
@@ -674,6 +905,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     role, tier = u["model_role"], u["model_tier"]
     model_line = f"Model aktif: *{model_full_label(role, tier)}*"
+    lock_reason = _model_lock_reason(role, tier)
+    if lock_reason:
+        model_line += f"\n⚠️ {lock_reason}"
 
     if u["is_unlimited"]:
         limit_line = "♾️ *Unlimited*"
@@ -967,6 +1201,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     role, tier = u["model_role"], u["model_tier"]
+    lock_reason = _model_lock_reason(role, tier)
+    if lock_reason:
+        await message.reply_text(f"🔒 {lock_reason}\nPilih model yang sesuai hardware lewat /model.")
+        return
+
     model_name = engine.resolve_model(role, tier)
     token = user_token_for(telegram_user.id)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
@@ -1024,6 +1263,11 @@ async def _process_and_reply_file(
         return
 
     role, tier = u["model_role"], u["model_tier"]
+    lock_reason = _model_lock_reason(role, tier)
+    if lock_reason:
+        await message.reply_text(f"🔒 {lock_reason}\nPilih model yang sesuai hardware lewat /model.")
+        return
+
     model_name = engine.resolve_model(role, tier)
     token = user_token_for(telegram_user.id)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
@@ -1175,6 +1419,7 @@ def main() -> None:
 
     # Callback query (inline button) handler untuk /model (alur 2 langkah: role -> tier)
     application.add_handler(CallbackQueryHandler(callback_model_role, pattern=r"^model_role:"))
+    application.add_handler(CallbackQueryHandler(callback_model_lock, pattern=r"^model_lock:"))
     application.add_handler(CallbackQueryHandler(callback_model_tier, pattern=r"^model_tier:"))
     application.add_handler(CallbackQueryHandler(callback_model_back, pattern=r"^model_back$"))
 
