@@ -54,6 +54,36 @@ ALL_MODELS=(
   "${OLLAMA_VISION_MODEL}"
 )
 
+# --- Role "extended": katalog 20+ model (CPU-only ringan s/d GPU besar) ---
+# TIDAK di-pull otomatis secara default (banyak model besar & butuh GPU kuat,
+# supaya instalasi standar tetap cepat/ringan). Set PULL_EXTENDED_MODELS=true
+# sebelum menjalankan install.sh, atau jalankan `ollama pull <nama_model>`
+# manual per model yang benar-benar mau dipakai.
+PULL_EXTENDED_MODELS="${PULL_EXTENDED_MODELS:-false}"
+EXTENDED_MODELS_NO_GPU=(
+  "qwen2.5:0.5b" "qwen2.5:1.5b" "tinyllama:1.1b" "gemma2:2b"
+  "phi3:3.8b" "llama3.2:3b" "qwen2.5:4b"
+)
+EXTENDED_MODELS_GPU_KECIL_MENENGAH=(
+  "mistral:7b" "llama3.1:8b" "gemma2:9b" "qwen2.5:14b"
+  "deepseek-r1:8b" "phi3:14b" "codellama:13b"
+)
+EXTENDED_MODELS_GPU_BESAR=(
+  "qwen2.5:32b" "deepseek-r1:32b" "mixtral:8x7b" "gemma2:27b" "codellama:34b" "yi:34b"
+)
+EXTENDED_MODELS_GPU_SANGAT_BESAR=(
+  "llama3.1:70b" "qwen2.5:72b" "deepseek-r1:70b" "llama3.1:405b"
+)
+EXTENDED_MODELS_ALL=(
+  "${EXTENDED_MODELS_NO_GPU[@]}"
+  "${EXTENDED_MODELS_GPU_KECIL_MENENGAH[@]}"
+  "${EXTENDED_MODELS_GPU_BESAR[@]}"
+  "${EXTENDED_MODELS_GPU_SANGAT_BESAR[@]}"
+)
+if [ "${PULL_EXTENDED_MODELS}" = "true" ]; then
+  ALL_MODELS+=("${EXTENDED_MODELS_ALL[@]}")
+fi
+
 # Rentang versi python-telegram-bot yang sudah diuji cocok dengan kode bot ini
 # (API modul telegram.ext & telegram.constants sejak v20 relatif stabil hingga v21.x).
 PTB_VERSION_SPEC="python-telegram-bot[all]>=21.0,<22.0"

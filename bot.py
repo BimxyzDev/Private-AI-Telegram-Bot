@@ -531,7 +531,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _role_keyboard(current_role: str) -> InlineKeyboardMarkup:
     buttons = []
-    for role in ("general", "coder"):
+    for role in engine.ROLE_ORDER:
         label = engine.ROLE_LABELS[role]
         if role == current_role:
             label += " ✅"

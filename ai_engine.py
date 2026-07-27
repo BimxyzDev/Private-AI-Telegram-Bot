@@ -95,44 +95,162 @@ ROLE_TIERS: Dict[str, Dict[str, str]] = {
         "medium": os.environ.get("OLLAMA_MODEL_CODER_MEDIUM", "qwen2.5-coder:7b"),
         "heavy": os.environ.get("OLLAMA_MODEL_CODER_HEAVY", "qwen2.5-coder:14b"),
     },
+    # --- Role "extended": katalog 20+ model, dari CPU-only super ringan sampai
+    # model raksasa yang WAJIB GPU (VRAM besar). Dipakai user/owner yang mau
+    # pilih model spesifik di luar 2 role default (general/coder), misal untuk
+    # eksperimen kualitas jawaban vs kebutuhan resource server.
+    # Semua nama model tetap bisa dioverride lewat env var seperti role lain.
+    "extended": {
+        # ==== CPU-ONLY (tidak butuh GPU, jalan di VPS biasa) ====
+        "ultra_ringan": os.environ.get("OLLAMA_MODEL_EXT_ULTRA_RINGAN", "qwen2.5:0.5b"),
+        "super_ringan": os.environ.get("OLLAMA_MODEL_EXT_SUPER_RINGAN", "qwen2.5:1.5b"),
+        "tinyllama": os.environ.get("OLLAMA_MODEL_EXT_TINYLLAMA", "tinyllama:1.1b"),
+        "gemma_2b": os.environ.get("OLLAMA_MODEL_EXT_GEMMA_2B", "gemma2:2b"),
+        "phi3_mini": os.environ.get("OLLAMA_MODEL_EXT_PHI3_MINI", "phi3:3.8b"),
+        "llama32_3b": os.environ.get("OLLAMA_MODEL_EXT_LLAMA32_3B", "llama3.2:3b"),
+        "qwen_4b": os.environ.get("OLLAMA_MODEL_EXT_QWEN_4B", "qwen2.5:4b"),
+        # ==== MEDIUM (CPU kuat / GPU kecil-menengah, 6-8GB VRAM ideal) ====
+        "mistral_7b": os.environ.get("OLLAMA_MODEL_EXT_MISTRAL_7B", "mistral:7b"),
+        "llama31_8b": os.environ.get("OLLAMA_MODEL_EXT_LLAMA31_8B", "llama3.1:8b"),
+        "gemma2_9b": os.environ.get("OLLAMA_MODEL_EXT_GEMMA2_9B", "gemma2:9b"),
+        "qwen_14b": os.environ.get("OLLAMA_MODEL_EXT_QWEN_14B", "qwen2.5:14b"),
+        "deepseek_r1_8b": os.environ.get("OLLAMA_MODEL_EXT_DEEPSEEK_R1_8B", "deepseek-r1:8b"),
+        "phi3_medium": os.environ.get("OLLAMA_MODEL_EXT_PHI3_MEDIUM", "phi3:14b"),
+        "codellama_13b": os.environ.get("OLLAMA_MODEL_EXT_CODELLAMA_13B", "codellama:13b"),
+        # ==== HEAVY (butuh GPU, 16-24GB VRAM ideal) ====
+        "qwen_32b": os.environ.get("OLLAMA_MODEL_EXT_QWEN_32B", "qwen2.5:32b"),
+        "deepseek_r1_32b": os.environ.get("OLLAMA_MODEL_EXT_DEEPSEEK_R1_32B", "deepseek-r1:32b"),
+        "mixtral_8x7b": os.environ.get("OLLAMA_MODEL_EXT_MIXTRAL_8X7B", "mixtral:8x7b"),
+        "gemma2_27b": os.environ.get("OLLAMA_MODEL_EXT_GEMMA2_27B", "gemma2:27b"),
+        "codellama_34b": os.environ.get("OLLAMA_MODEL_EXT_CODELLAMA_34B", "codellama:34b"),
+        "yi_34b": os.environ.get("OLLAMA_MODEL_EXT_YI_34B", "yi:34b"),
+        # ==== ULTRA HEAVY (WAJIB GPU besar, 48GB+ VRAM / multi-GPU) ====
+        "llama31_70b": os.environ.get("OLLAMA_MODEL_EXT_LLAMA31_70B", "llama3.1:70b"),
+        "qwen_72b": os.environ.get("OLLAMA_MODEL_EXT_QWEN_72B", "qwen2.5:72b"),
+        "deepseek_r1_70b": os.environ.get("OLLAMA_MODEL_EXT_DEEPSEEK_R1_70B", "deepseek-r1:70b"),
+        "llama3_405b": os.environ.get("OLLAMA_MODEL_EXT_LLAMA3_405B", "llama3.1:405b"),
+    },
 }
 
 # Label tampilan untuk tiap role (dipakai di /model dan /status)
 ROLE_LABELS: Dict[str, str] = {
     "general": "🗣️ General Chat",
     "coder": "💻 Coder / IT",
+    "extended": "🧩 Extended Catalog (20+ Model)",
 }
+
+# Urutan role, dipakai di mana pun daftar role perlu ditampilkan konsisten.
+ROLE_ORDER: List[str] = ["general", "coder", "extended"]
 
 # Label pendek per tier (dipakai untuk tombol & ringkasan)
 TIER_SHORT_LABELS: Dict[str, str] = {
+    "ultra_ringan": "⚪ Ultra Ringan",
     "super_ringan": "⚪ Super Ringan",
     "light": "🟢 Light",
+    "tinyllama": "🟢 TinyLlama",
+    "gemma_2b": "🟢 Gemma 2B",
+    "phi3_mini": "🟢 Phi-3 Mini",
+    "llama32_3b": "🟢 Llama 3.2 3B",
+    "qwen_4b": "🟢 Qwen 4B",
     "medium": "🟡 Medium",
+    "mistral_7b": "🟡 Mistral 7B",
+    "llama31_8b": "🟡 Llama 3.1 8B",
+    "gemma2_9b": "🟡 Gemma 2 9B",
+    "qwen_14b": "🟡 Qwen 14B",
+    "deepseek_r1_8b": "🟡 DeepSeek R1 8B",
+    "phi3_medium": "🟡 Phi-3 Medium",
+    "codellama_13b": "🟡 CodeLlama 13B",
     "heavy": "🔴 Heavy",
+    "qwen_32b": "🔴 Qwen 32B (GPU)",
+    "deepseek_r1_32b": "🔴 DeepSeek R1 32B (GPU)",
+    "mixtral_8x7b": "🔴 Mixtral 8x7B (GPU)",
+    "gemma2_27b": "🔴 Gemma 2 27B (GPU)",
+    "codellama_34b": "🔴 CodeLlama 34B (GPU)",
+    "yi_34b": "🔴 Yi 34B (GPU)",
+    "llama31_70b": "🟣 Llama 3.1 70B (GPU besar)",
+    "qwen_72b": "🟣 Qwen 72B (GPU besar)",
+    "deepseek_r1_70b": "🟣 DeepSeek R1 70B (GPU besar)",
+    "llama3_405b": "🟣 Llama 3.1 405B (Multi-GPU)",
 }
 
 # Deskripsi singkat tiap tier, dipakai untuk teks penjelasan di /model.
 TIER_DESCRIPTIONS: Dict[str, str] = {
+    "ultra_ringan": "Model terkecil, jalan di CPU apa pun tanpa GPU. Cocok untuk balasan super cepat & kuota irit.",
     "super_ringan": "Paling irit kuota & tercepat di CPU. Cocok untuk chat singkat/tanya cepat.",
     "light": "Paling cepat & ringan di CPU. Cocok untuk obrolan singkat/pertanyaan simpel.",
+    "tinyllama": "Model sangat kecil, tanpa GPU. Kualitas terbatas, cocok untuk task sederhana.",
+    "gemma_2b": "Ringan tanpa GPU, kualitas lebih baik dari ultra ringan untuk chat harian.",
+    "phi3_mini": "Ringan, tanpa GPU, kuat untuk reasoning singkat & instruksi jelas.",
+    "llama32_3b": "Ringan tanpa GPU, seimbang untuk chat umum sehari-hari.",
+    "qwen_4b": "Tanpa GPU, kualitas jawaban lebih baik dari kelas 1.5-3B dengan CPU kuat.",
     "medium": "Seimbang antara kualitas jawaban dan kecepatan. Cocok dipakai sehari-hari.",
+    "mistral_7b": "CPU kuat/GPU kecil, jawaban natural & cepat untuk task umum.",
+    "llama31_8b": "CPU kuat/GPU kecil, seimbang kualitas-kecepatan, default general chat.",
+    "gemma2_9b": "CPU kuat/GPU kecil-menengah, kualitas reasoning lebih baik dari 7-8B.",
+    "qwen_14b": "Butuh CPU sangat kuat atau GPU kecil, cocok task lebih kompleks.",
+    "deepseek_r1_8b": "Model reasoning (chain-of-thought), GPU kecil disarankan untuk kecepatan.",
+    "phi3_medium": "GPU kecil-menengah disarankan, kualitas reasoning di atas rata-rata ukurannya.",
+    "codellama_13b": "GPU kecil-menengah disarankan, khusus kebutuhan coding/debugging.",
     "heavy": "Kualitas & reasoning terbaik, lebih lambat & lebih berat di CPU.",
+    "qwen_32b": "Butuh GPU (~16-24GB VRAM), kualitas jawaban jauh lebih baik & konsisten.",
+    "deepseek_r1_32b": "Butuh GPU (~24GB VRAM), reasoning mendalam untuk soal kompleks.",
+    "mixtral_8x7b": "Butuh GPU (~24GB VRAM, arsitektur MoE), kuat untuk multi-topik & bahasa.",
+    "gemma2_27b": "Butuh GPU (~24GB VRAM), kualitas jawaban kelas atas.",
+    "codellama_34b": "Butuh GPU (~24GB+ VRAM), coding kompleks & konteks panjang.",
+    "yi_34b": "Butuh GPU (~24GB+ VRAM), reasoning & bahasa multi-domain kelas atas.",
+    "llama31_70b": "WAJIB GPU besar (~48GB VRAM atau multi-GPU), kualitas mendekati model komersial.",
+    "qwen_72b": "WAJIB GPU besar (~48GB VRAM atau multi-GPU), reasoning & multibahasa terbaik.",
+    "deepseek_r1_70b": "WAJIB GPU besar (~48GB VRAM atau multi-GPU), reasoning terdalam di katalog ini.",
+    "llama3_405b": "WAJIB multi-GPU datacenter (ratusan GB VRAM), kelas riset/enterprise.",
 }
 
 # Urutan tier per role (ringan -> berat), dipakai untuk urutan tombol supaya konsisten.
 ROLE_TIER_ORDER: Dict[str, List[str]] = {
     "general": ["super_ringan", "light", "medium", "heavy"],
     "coder": ["light", "medium", "heavy"],
+    "extended": [
+        # CPU-only
+        "ultra_ringan", "super_ringan", "tinyllama", "gemma_2b", "phi3_mini", "llama32_3b", "qwen_4b",
+        # medium (CPU kuat / GPU kecil)
+        "mistral_7b", "llama31_8b", "gemma2_9b", "qwen_14b", "deepseek_r1_8b", "phi3_medium", "codellama_13b",
+        # heavy (GPU)
+        "qwen_32b", "deepseek_r1_32b", "mixtral_8x7b", "gemma2_27b", "codellama_34b", "yi_34b",
+        # ultra heavy (GPU besar/multi-GPU)
+        "llama31_70b", "qwen_72b", "deepseek_r1_70b", "llama3_405b",
+    ],
 }
 
-# Multiplier kuota token berdasarkan beban CPU tiap tier (berlaku lintas role -- besaran
+# Multiplier kuota token berdasarkan beban CPU/GPU tiap tier (berlaku lintas role -- besaran
 # model yang menentukan beban, bukan role-nya). Contoh: 1.000 token asli hasil Ollama
 # pada tier medium (2x) memotong 2.000 token kuota user.
 TOKEN_MULTIPLIER: Dict[str, int] = {
+    "ultra_ringan": 1,
     "super_ringan": 1,
     "light": 1,
+    "tinyllama": 1,
+    "gemma_2b": 1,
+    "phi3_mini": 1,
+    "llama32_3b": 1,
+    "qwen_4b": 1,
     "medium": 2,
+    "mistral_7b": 2,
+    "llama31_8b": 2,
+    "gemma2_9b": 2,
+    "qwen_14b": 2,
+    "deepseek_r1_8b": 2,
+    "phi3_medium": 2,
+    "codellama_13b": 2,
     "heavy": 3,
+    "qwen_32b": 3,
+    "deepseek_r1_32b": 3,
+    "mixtral_8x7b": 3,
+    "gemma2_27b": 3,
+    "codellama_34b": 3,
+    "yi_34b": 3,
+    "llama31_70b": 5,
+    "qwen_72b": 5,
+    "deepseek_r1_70b": 5,
+    "llama3_405b": 8,
 }
 
 # Role + tier default untuk user baru.

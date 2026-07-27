@@ -39,12 +39,21 @@ DEFAULT_DAILY_TOKEN_LIMIT = 50_000
 # selalu valid terhadap ai_engine.ROLE_TIERS (general/medium -> llama3.1:8b).
 DEFAULT_MODEL_ROLE = "general"
 DEFAULT_MODEL_TIER = "medium"
-VALID_MODEL_ROLES = ("general", "coder")
+VALID_MODEL_ROLES = ("general", "coder", "extended")
 # Catatan: validasi apakah kombinasi role+tier benar-benar ada dilakukan di
 # ai_engine.resolve_model (fallback otomatis), bukan di sini -- supaya database
 # tidak perlu tahu daftar tier yang valid untuk tiap role (single source of truth
-# ada di ai_engine.ROLE_TIERS).
-VALID_MODEL_TIERS = ("super_ringan", "light", "medium", "heavy")
+# ada di ai_engine.ROLE_TIERS). Daftar tier di bawah mencakup SEMUA tier lintas
+# role (general/coder/extended) -- termasuk 20+ model role "extended" dari
+# ultra ringan (CPU-only) sampai ultra heavy (wajib GPU besar/multi-GPU).
+VALID_MODEL_TIERS = (
+    "super_ringan", "light", "medium", "heavy",
+    "ultra_ringan", "tinyllama", "gemma_2b", "phi3_mini", "llama32_3b", "qwen_4b",
+    "mistral_7b", "llama31_8b", "gemma2_9b", "qwen_14b", "deepseek_r1_8b",
+    "phi3_medium", "codellama_13b",
+    "qwen_32b", "deepseek_r1_32b", "mixtral_8x7b", "gemma2_27b", "codellama_34b", "yi_34b",
+    "llama31_70b", "qwen_72b", "deepseek_r1_70b", "llama3_405b",
+)
 
 
 def set_db_path(path: str) -> None:
