@@ -1,24 +1,37 @@
 """
-Private AI Telegram Bot
-==========================
-Bot Telegram (mode polling) yang menghubungkan user ke:
-  - Sistem 3 Tier model chat/coding, dipilih user lewat /model:
-        🟢 Light  -> qwen2.5-coder:1.5b  (kuota token x1)
-        🟡 Medium -> qwen2.5-coder:7b    (kuota token x2, default)
-        🔴 Heavy  -> qwen2.5-coder:14b   (kuota token x3)
-  - qwen2.5vl  -> analisis gambar & video (vision)
+Enterprise Private AI Telegram Bot
+======================================
+Bot Telegram (mode polling) yang menghubungkan user ke cluster AI terdistribusi
+(Master-Worker Architecture) berbasis Ollama, dengan Smart Hardware Management,
+Smart Worker Selection, Model Fallback otomatis, dan Zero-OOM Queue Protection.
 
-Fitur:
-  - Setiap user mendapat kuota 50.000 TOKEN/hari (reset otomatis tiap 24 jam),
-    dipotong sesuai jumlah token asli dari Ollama dikali multiplier tier model.
-  - Owner bisa generate kode redeem (/gencode) untuk menaikkan kuota token user
-    lain, termasuk ke "unlimited", dengan masa berlaku dalam hari. Setelah
-    masa berlaku habis, otomatis kembali ke kuota default (50.000/hari).
-  - Upload dokumen/PDF/DOCX/gambar/video/ZIP tetap didukung penuh.
-  - Panggilan ke Ollama (bisa memakan waktu s/d 10 menit) dijalankan di thread
-    terpisah (asyncio.to_thread) dan Application berjalan dengan
-    concurrent_updates aktif, sehingga bot TIDAK hang/freeze untuk user lain
-    saat ada request yang sedang diproses lama.
+Fitur inti (user):
+  - Sistem Role + Tier model chat/coding, dipilih user lewat /model (2 langkah:
+    Role -> Tier), termasuk katalog "extended" 20+ model dari CPU-only ringan
+    sampai model raksasa yang wajib GPU besar/multi-GPU.
+  - qwen2.5vl -> analisis gambar & video (vision).
+  - Kuota TOKEN harian (reset otomatis tiap 24 jam), dipotong sesuai jumlah
+    token asli dari Ollama dikali multiplier tier model.
+  - Redeem code (/redeem) untuk menaikkan kuota token, termasuk "unlimited",
+    dengan masa berlaku dalam hari.
+  - Upload dokumen/PDF/DOCX/gambar/video/ZIP didukung penuh.
+  - MODEL FALLBACK OTOMATIS & TRANSPARAN: jika model yang diminta user tidak
+    tersedia (VRAM penuh/locked) di seluruh cluster, bot otomatis fallback ke
+    model lebih kecil dan MEMBERI TAHU user model apa yang benar-benar dipakai
+    (bukan diam-diam mengganti tanpa penjelasan).
+
+Fitur admin (owner-only), lihat juga node_manager.py & worker_agent.py:
+  /hardware   - cek spesifikasi hardware SEMUA Worker Node (GPU/VRAM/CPU/RAM)
+  /modelsync  - sinkronkan ulang cache model lokal tiap Worker Node
+  /pullmodel  - trigger `ollama pull` di Worker Node tertentu / semua node
+  /unload     - unload model tertentu dari VRAM Worker Node (bebaskan resource)
+  /worker     - ringkasan status seluruh cluster (online/offline, safe mode, dll)
+  /queue      - lihat antrian aktif per node + histori event terakhir
+
+Panggilan ke Ollama (bisa memakan waktu s/d 10 menit) dijalankan di thread
+terpisah (asyncio.to_thread) dan Application berjalan dengan concurrent_updates
+aktif, sehingga bot TIDAK hang/freeze untuk user lain saat ada request yang
+sedang diproses lama.
 
 Jalankan dengan:
     python3 bot.py
@@ -122,6 +135,13 @@ OWNER_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("ban", "[Owner] Nonaktifkan akses user"),
     BotCommand("unban", "[Owner] Aktifkan kembali akses user"),
     BotCommand("broadcast", "[Owner] Kirim pesan ke semua user"),
+    # --- Cluster / Hardware Management (Enterprise, hanya relevan CLUSTER_MODE=master) ---
+    BotCommand("hardware", "[Owner] Cek spek hardware semua Worker Node"),
+    BotCommand("modelsync", "[Owner] Sinkronkan cache model tiap Worker Node"),
+    BotCommand("pullmodel", "[Owner] Pull model baru ke Worker Node"),
+    BotCommand("unload", "[Owner] Unload model dari VRAM Worker Node"),
+    BotCommand("worker", "[Owner] Info status cluster Worker Node"),
+    BotCommand("queue", "[Owner] Lihat antrian aktif cluster"),
 ]
 
 logging.basicConfig(
@@ -136,16 +156,15 @@ def model_full_label(role: str, tier: str) -> str:
     role_label = engine.ROLE_LABELS.get(role, role)
     tier_label = engine.TIER_SHORT_LABELS.get(tier, tier)
     model_name = engine.resolve_model(role, tier)
-    lock_suffix = " 🔒" if _model_lock_reason(role, tier) else ""
-    return f"{role_label} · {tier_label} ({model_name}){lock_suffix}"
+    return f"{role_label} · {tier_label} ({model_name})"
 
 
 def model_short_label(role: str, tier: str) -> str:
     """Label pendek 'Role · Tier' dipakai di /users (ringkasan admin)."""
     role_label = engine.ROLE_LABELS.get(role, role)
     tier_label = engine.TIER_SHORT_LABELS.get(tier, tier)
-    lock_suffix = " 🔒" if _model_lock_reason(role, tier) else ""
-    return f"{role_label} · {tier_label}{lock_suffix}"
+    return f"{role_label} · {tier_label}"
+
 GPU_DISABLED_IMAGE_MESSAGE = (
     "⚠️ Maaf, server saat ini berjalan tanpa GPU (CPU-Only). Fitur analisis gambar "
     "dinonaktifkan demi menjaga stabilitas server."
@@ -208,145 +227,14 @@ def subprocess_run_nvidia_smi() -> bool:
     return proc.returncode == 0
 
 
-def detect_gpu_profile() -> dict:
-    """Mendeteksi GPU + perkiraan VRAM agar tier berat bisa dikunci dengan aman."""
-    profile = {
-        "has_gpu": False,
-        "backend": None,
-        "gpu_count": 0,
-        "max_vram_gb": 0.0,
-    }
-
-    try:
-        if subprocess_run_nvidia_smi():
-            mem_query = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if mem_query.returncode == 0:
-                values = []
-                for line in mem_query.stdout.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        values.append(float(line) / 1024.0)
-                    except ValueError:
-                        continue
-                if values:
-                    profile.update(
-                        {
-                            "has_gpu": True,
-                            "backend": "nvidia-smi",
-                            "gpu_count": len(values),
-                            "max_vram_gb": max(values),
-                        }
-                    )
-                    return profile
-    except Exception as e:
-        logger.debug("Deteksi GPU via nvidia-smi gagal/tidak tersedia: %s", e)
-
-    try:
-        import torch  # type: ignore
-
-        if torch.cuda.is_available():
-            values = []
-            for idx in range(torch.cuda.device_count()):
-                props = torch.cuda.get_device_properties(idx)
-                values.append(props.total_memory / (1024 ** 3))
-            if values:
-                profile.update(
-                    {
-                        "has_gpu": True,
-                        "backend": "torch",
-                        "gpu_count": len(values),
-                        "max_vram_gb": max(values),
-                    }
-                )
-                return profile
-    except ImportError:
-        logger.debug("Library torch tidak terinstall, melewati pengecekan torch.cuda.is_available().")
-    except Exception as e:
-        logger.debug("Deteksi GPU via torch gagal: %s", e)
-
-    logger.warning(
-        "Tidak ada GPU terdeteksi (nvidia-smi maupun torch.cuda tidak tersedia/aktif). "
-        "Bot akan berjalan mode CPU-Only, fitur analisis gambar akan dinonaktifkan."
-    )
-    return profile
-
-
 # Dideteksi sekali saat modul di-load (startup bot). Dipakai sebagai guardrail
 # di handle_photo agar server CPU-only tidak dipaksa memproses request gambar
 # yang berat dan bisa mengganggu stabilitas (lihat GPU_DISABLED_IMAGE_MESSAGE).
-GPU_PROFILE: dict = detect_gpu_profile()
-HAS_GPU: bool = bool(GPU_PROFILE.get("has_gpu"))
-GPU_MAX_VRAM_GB: float = float(GPU_PROFILE.get("max_vram_gb") or 0.0)
+HAS_GPU: bool = detect_gpu()
 
 
 # =========================================================================
 # HELPER
-# Ambang VRAM konservatif untuk tier yang benar-benar berat.
-TIER_MIN_VRAM_GB = {
-    "heavy": 12.0,
-    "qwen_14b": 12.0,
-    "phi3_medium": 12.0,
-    "codellama_13b": 12.0,
-    "qwen_32b": 24.0,
-    "deepseek_r1_32b": 24.0,
-    "mixtral_8x7b": 24.0,
-    "gemma2_27b": 24.0,
-    "codellama_34b": 24.0,
-    "yi_34b": 24.0,
-    "llama31_70b": 48.0,
-    "qwen_72b": 48.0,
-    "deepseek_r1_70b": 48.0,
-    "llama3_405b": 96.0,
-}
-
-
-def _required_vram_gb(tier: str) -> float:
-    return float(TIER_MIN_VRAM_GB.get(tier, 0.0))
-
-
-def _model_lock_reason(role: str, tier: str) -> Optional[str]:
-    """Kembalikan alasan jika model harus dikunci karena hardware/cluster tidak cukup."""
-    model_name = engine.ROLE_TIERS.get(role, {}).get(tier)
-    if not model_name:
-        return "Model tidak valid."
-
-    if engine.CLUSTER_MODE == "master":
-        try:
-            import node_manager
-
-            candidates = node_manager.get_candidate_nodes(model_name)
-            if candidates:
-                return None
-            if not engine.MASTER_OLLAMA_FALLBACK:
-                return f"Model '{model_name}' belum tersedia di worker cluster saat ini."
-        except Exception as exc:
-            logger.debug("Gagal mengecek kandidat worker untuk model %s: %s", model_name, exc)
-
-    required_vram = _required_vram_gb(tier)
-    if required_vram <= 0:
-        return None
-
-    if not HAS_GPU:
-        return (
-            f"Model '{model_name}' dikunci karena server ini CPU-only. "
-            f"Butuh GPU minimal {required_vram:.0f} GB VRAM."
-        )
-
-    if GPU_MAX_VRAM_GB < required_vram:
-        return (
-            f"Model '{model_name}' dikunci karena GPU hanya {GPU_MAX_VRAM_GB:.0f} GB VRAM. "
-            f"Butuh minimal {required_vram:.0f} GB VRAM."
-        )
-
-    return None
-
 # =========================================================================
 
 def is_owner(telegram_id: int) -> bool:
@@ -636,10 +524,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "atau kirim file (dokumen, PDF, DOCX, gambar, video, ZIP) untuk saya analisis.\n\n"
         "Perintah yang tersedia:\n"
         "/status - lihat sisa kuota token & model aktif kamu hari ini\n"
-        "/model - pilih tier model AI (Light/Medium/Heavy)\n"
+        "/model - pilih Role & Tier model AI\n"
         "/redeem <kode> - tukar kode redeem untuk menaikkan kuota token\n"
         "/reset - hapus riwayat chat kamu (mulai percakapan baru)\n"
-        "/help - tampilkan bantuan ini"
+        "/help - tampilkan bantuan ini\n\n"
+        "_Catatan: jika model pilihanmu sedang penuh, sistem otomatis akan mengalihkan "
+        "ke model lain yang tersedia dan memberitahumu._"
     )
     await update.message.reply_text(text, parse_mode=constants.ParseMode.MARKDOWN)
 
@@ -649,10 +539,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =========================================================================
-def _tier_button_locked(role: str, tier: str) -> bool:
-    return _model_lock_reason(role, tier) is not None
-
-
 # COMMAND: /model - pilih Role (General/Coder) lalu Tier, lewat Inline Keyboard
 # =========================================================================
 # Alur (state disimpan di Telegram sendiri lewat callback_data, BUKAN di memori bot,
@@ -678,14 +564,10 @@ def _role_keyboard(current_role: str) -> InlineKeyboardMarkup:
 def _tier_keyboard(role: str, current_role: str, current_tier: str) -> InlineKeyboardMarkup:
     buttons = []
     for tier in engine.ROLE_TIER_ORDER[role]:
-        locked = _tier_button_locked(role, tier)
         label = f"{engine.TIER_SHORT_LABELS[tier]} ({engine.ROLE_TIERS[role][tier]})"
-        if locked:
-            label = f"🔒 {label}"
         if role == current_role and tier == current_tier:
             label += " ✅"
-        callback_data = f"model_lock:{role}:{tier}" if locked else f"model_tier:{role}:{tier}"
-        buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
+        buttons.append([InlineKeyboardButton(label, callback_data=f"model_tier:{role}:{tier}")])
     buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="model_back")])
     return InlineKeyboardMarkup(buttons)
 
@@ -707,15 +589,11 @@ def _tier_select_text(role: str, current_role: str, current_tier: str) -> str:
         tier_label = engine.TIER_SHORT_LABELS[tier]
         desc = engine.TIER_DESCRIPTIONS[tier]
         multiplier = engine.TOKEN_MULTIPLIER[tier]
-        locked = _tier_button_locked(role, tier)
-        status = "🔒 Terkunci" if locked else f"Kuota token x{multiplier}."
-        if locked:
-            reason = _model_lock_reason(role, tier)
-            if reason:
-                status = f"🔒 Terkunci — {reason}"
-        lines.append(f"{tier_label} — `{model_name}`\n   {desc} {status}\n")
+        lines.append(f"{tier_label} — `{model_name}`\n   {desc} Kuota token x{multiplier}.\n")
     lines.append(f"Model aktif kamu saat ini: *{model_full_label(current_role, current_tier)}*")
     return "\n".join(lines)
+
+
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     u = db.get_or_create_user(user.id, user.username)
@@ -752,36 +630,6 @@ async def callback_model_role(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
 
-async def callback_model_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Callback untuk tier yang terkunci. Hanya tampilkan alasan, jangan ubah model."""
-    query = update.callback_query
-    payload = (query.data or "").split(":")
-    if len(payload) != 3:
-        await query.answer("❌ Data tombol tidak valid.", show_alert=True)
-        return
-    _, role, tier = payload
-    reason = _model_lock_reason(role, tier)
-    if not reason:
-        await query.answer("Model ini tidak terkunci.", show_alert=False)
-        return
-    await query.answer(f"🔒 {reason}", show_alert=True)
-
-
-async def callback_model_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Callback untuk tier yang terkunci. Hanya tampilkan alasan, jangan ubah model."""
-    query = update.callback_query
-    payload = (query.data or "").split(":")
-    if len(payload) != 3:
-        await query.answer("❌ Data tombol tidak valid.", show_alert=True)
-        return
-    _, role, tier = payload
-    reason = _model_lock_reason(role, tier)
-    if not reason:
-        await query.answer("Model ini tidak terkunci.", show_alert=False)
-        return
-    await query.answer(f"🔒 {reason}", show_alert=True)
-
-
 async def callback_model_tier(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Langkah 2: user memilih tier di dalam role yang sudah dipilih -> terapkan."""
     query = update.callback_query
@@ -804,29 +652,6 @@ async def callback_model_tier(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer(f"❌ Tier '{tier}' tidak tersedia untuk role ini.", show_alert=True)
         return
 
-    reason = _model_lock_reason(role, tier)
-    if reason:
-        await query.answer(f"🔒 {reason}", show_alert=True)
-        return
-
-    model_name = engine.ROLE_TIERS[role][tier]
-    needs_local_pull = engine.CLUSTER_MODE != "master"
-    if engine.CLUSTER_MODE == "master":
-        try:
-            import node_manager
-
-            needs_local_pull = not node_manager.get_candidate_nodes(model_name) and engine.MASTER_OLLAMA_FALLBACK
-        except Exception as exc:
-            logger.debug("Gagal cek kandidat worker saat memilih model %s: %s", model_name, exc)
-            needs_local_pull = engine.MASTER_OLLAMA_FALLBACK
-
-    if needs_local_pull:
-        try:
-            await asyncio.to_thread(engine.ensure_model_ready, model_name)
-        except engine.AIEngineError as exc:
-            await query.answer(f"❌ {exc.user_message}", show_alert=True)
-            return
-
     db.get_or_create_user(user.id, user.username)
     db.set_model_role_tier(user.id, role, tier)
 
@@ -841,42 +666,8 @@ async def callback_model_tier(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     except TelegramError:
         pass
-    except TelegramError:
-        pass
 
 
-async def callback_model_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Tombol '⬅️ Kembali' di layar tier -> kembali ke layar pilih role."""
-    query = update.callback_query
-    user = query.from_user
-    u = db.get_or_create_user(user.id, user.username)
-    current_role, current_tier = u["model_role"], u["model_tier"]
-
-    await query.answer()
-    try:
-        await query.edit_message_text(
-            _role_select_text(current_role, current_tier),
-            parse_mode=constants.ParseMode.MARKDOWN,
-            reply_markup=_role_keyboard(current_role),
-        )
-    except TelegramError:
-        pass
-async def callback_model_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Tombol '⬅️ Kembali' di layar tier -> kembali ke layar pilih role."""
-    query = update.callback_query
-    user = query.from_user
-    u = db.get_or_create_user(user.id, user.username)
-    current_role, current_tier = u["model_role"], u["model_tier"]
-
-    await query.answer()
-    try:
-        await query.edit_message_text(
-            _role_select_text(current_role, current_tier),
-            parse_mode=constants.ParseMode.MARKDOWN,
-            reply_markup=_role_keyboard(current_role),
-        )
-    except TelegramError:
-        pass
 async def callback_model_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Tombol '⬅️ Kembali' di layar tier -> kembali ke layar pilih role."""
     query = update.callback_query
@@ -905,9 +696,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     role, tier = u["model_role"], u["model_tier"]
     model_line = f"Model aktif: *{model_full_label(role, tier)}*"
-    lock_reason = _model_lock_reason(role, tier)
-    if lock_reason:
-        model_line += f"\n⚠️ {lock_reason}"
 
     if u["is_unlimited"]:
         limit_line = "♾️ *Unlimited*"
@@ -1147,6 +935,326 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # =========================================================================
+# COMMAND ADMIN (OWNER ONLY): CLUSTER & HARDWARE MANAGEMENT (ENTERPRISE)
+# =========================================================================
+# Semua command di bawah ini HANYA berfungsi penuh jika CLUSTER_MODE=master
+# (lihat ai_engine.CLUSTER_MODE). Di mode 'standalone' (Ollama lokal saja),
+# command ini menjawab dengan pesan informatif alih-alih error, karena tidak
+# ada registry Worker Node untuk ditanyai.
+
+def _require_cluster_mode() -> Optional[str]:
+    """Return pesan error jika bukan mode cluster, None jika boleh lanjut."""
+    if engine.CLUSTER_MODE != "master":
+        return (
+            "ℹ️ Perintah ini hanya berlaku di *Master Node* (CLUSTER_MODE=master). "
+            "Server ini berjalan mode *standalone* (Ollama lokal langsung), jadi "
+            "tidak ada registry Worker Node untuk ditampilkan."
+        )
+    return None
+
+
+def _fmt_gb(value) -> str:
+    return f"{value:.1f}GB" if isinstance(value, (int, float)) else "-"
+
+
+def _fmt_pct(value) -> str:
+    return f"{value:.1f}%" if isinstance(value, (int, float)) else "-"
+
+
+async def cmd_hardware(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /hardware -- Cek spesifikasi hardware LENGKAP semua Worker Node terdaftar:
+    GPU, VRAM, CUDA, CPU, RAM. Data diambil dari cache health-check terakhir
+    (node_manager.py), TIDAK melakukan ping baru (supaya instan, bukan menunggu
+    Worker Node merespons).
+    """
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("⛔ Perintah ini khusus owner.")
+        return
+
+    err = _require_cluster_mode()
+    if err:
+        await update.message.reply_text(err, parse_mode=constants.ParseMode.MARKDOWN)
+        return
+
+    import node_manager
+    nodes = node_manager.get_cluster_snapshot()
+    if not nodes:
+        await update.message.reply_text("Belum ada Worker Node yang terdaftar di cluster.")
+        return
+
+    lines = ["🖥️ *Spesifikasi Hardware Cluster*\n"]
+    for n in nodes:
+        status_emoji = {"online": "🟢", "offline": "🔴", "unauthorized": "🟡", "error": "🟠"}.get(n["status"], "⚪")
+        lines.append(f"{status_emoji} *{n['name']}* ({n['status']})")
+        if n["status"] != "online":
+            lines.append("   (data hardware tidak tersedia, node tidak online)\n")
+            continue
+
+        if n.get("has_gpu"):
+            lines.append(
+                f"   GPU: `{n.get('gpu_vendor', '')} {n.get('gpu_name', '')}` "
+                f"(CUDA {n.get('cuda_version', '-')})"
+            )
+            lines.append(
+                f"   VRAM: {_fmt_gb(n.get('vram_free_gb'))} bebas / {_fmt_gb(n.get('vram_total_gb'))} total "
+                f"({_fmt_pct(n.get('vram_used_pct'))} terpakai)"
+            )
+        else:
+            lines.append("   GPU: `CPU-Only` (tidak ada GPU terdeteksi)")
+
+        lines.append(
+            f"   CPU: {n.get('cpu_count', '-')} core, {_fmt_pct(n.get('cpu_usage'))} usage | "
+            f"RAM: {_fmt_gb(n.get('ram_total_gb'))} total, {_fmt_pct(n.get('ram_usage'))} usage"
+        )
+        if n.get("safe_mode"):
+            lines.append("   ⚠️ *SAFE MODE AKTIF* — model besar dikunci sementara")
+        lines.append("")
+
+    await send_long_message(update, "\n".join(lines))
+
+
+async def cmd_worker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /worker -- Ringkasan status cluster: jumlah node online/offline, model
+    ready/locked per node, dan status Safe Mode. Lebih ringkas dari /hardware
+    (fokus ke ketersediaan, bukan spek detail).
+    """
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("⛔ Perintah ini khusus owner.")
+        return
+
+    err = _require_cluster_mode()
+    if err:
+        await update.message.reply_text(err, parse_mode=constants.ParseMode.MARKDOWN)
+        return
+
+    import node_manager
+    nodes = node_manager.get_cluster_snapshot()
+    if not nodes:
+        await update.message.reply_text("Belum ada Worker Node yang terdaftar di cluster.")
+        return
+
+    online_count = sum(1 for n in nodes if n["status"] == "online")
+    lines = [f"🌐 *Status Cluster* — {online_count}/{len(nodes)} node online\n"]
+
+    for n in nodes:
+        status_emoji = {"online": "🟢", "offline": "🔴", "unauthorized": "🟡", "error": "🟠"}.get(n["status"], "⚪")
+        enabled_flag = "" if n["enabled"] else " (disabled)"
+        lines.append(f"{status_emoji} *{n['name']}*{enabled_flag} — {n['status']}")
+
+        if n["status"] == "online":
+            ready = [m["name"] for m in n.get("models_detail", []) if m.get("status") == "ready"]
+            locked = [m["name"] for m in n.get("models_detail", []) if "locked" in m.get("status", "")]
+            lines.append(f"   Task aktif: {n.get('active_tasks', 0)} | Latency: {n.get('latency_ms', 0):.0f}ms")
+            if ready:
+                lines.append(f"   ✅ Ready: `{', '.join(ready[:5])}`" + (" ..." if len(ready) > 5 else ""))
+            if locked:
+                lines.append(f"   🔒 Locked: `{', '.join(locked[:5])}`" + (" ..." if len(locked) > 5 else ""))
+            if n.get("safe_mode"):
+                lines.append("   ⚠️ SAFE MODE AKTIF")
+        lines.append("")
+
+    await send_long_message(update, "\n".join(lines))
+
+
+async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /queue -- Lihat antrian aktif di seluruh cluster (Smart Queue System):
+    total task aktif per node + histori 15 event terakhir (queued/started/
+    completed/failed/fallback), berguna untuk debug kenapa suatu request lambat
+    atau kena fallback.
+    """
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("⛔ Perintah ini khusus owner.")
+        return
+
+    err = _require_cluster_mode()
+    if err:
+        await update.message.reply_text(err, parse_mode=constants.ParseMode.MARKDOWN)
+        return
+
+    import node_manager
+    summary = node_manager.get_queue_summary()
+
+    lines = [
+        f"📋 *Antrian Cluster*\n",
+        f"Node online: {summary['total_nodes_online']}/{summary['total_nodes_all']}",
+        f"Total task aktif: {summary['total_active_tasks']}\n",
+    ]
+
+    for n in summary["nodes"]:
+        safe_flag = " ⚠️SAFE" if n["safe_mode"] else ""
+        lines.append(f"*{n['name']}*{safe_flag}: {n['active_tasks']} task aktif")
+
+    if summary["recent_events"]:
+        lines.append("\n📜 *Event Terakhir:*")
+        event_emoji = {
+            "queued": "⏳", "started": "▶️", "completed": "✅", "failed": "❌", "fallback": "🔀"
+        }
+        for ev in summary["recent_events"][:15]:
+            emoji = event_emoji.get(ev["event_type"], "•")
+            node_part = f" @{ev['node_name']}" if ev["node_name"] else ""
+            detail_part = f" — {ev['detail'][:60]}" if ev["detail"] else ""
+            lines.append(f"{emoji} `{ev['model_name']}`{node_part}{detail_part}")
+
+    await send_long_message(update, "\n".join(lines))
+
+
+async def cmd_pullmodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /pullmodel <model_name> [node_id]
+    Trigger `ollama pull` di Worker Node. Jika node_id tidak diisi, pull
+    dilakukan ke SEMUA node online sekaligus (paralel per-node di sisi
+    node_manager). Progress dilaporkan lewat log Worker Node masing-masing
+    (lihat worker_agent.py), bot hanya menunggu hasil akhirnya.
+    """
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("⛔ Perintah ini khusus owner.")
+        return
+
+    err = _require_cluster_mode()
+    if err:
+        await update.message.reply_text(err, parse_mode=constants.ParseMode.MARKDOWN)
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Format:\n"
+            "`/pullmodel <nama_model>` — pull ke SEMUA node online\n"
+            "`/pullmodel <nama_model> <node_id>` — pull ke node tertentu saja\n\n"
+            "Contoh: `/pullmodel qwen2.5:32b`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+        return
+
+    model_name = context.args[0]
+    node_id = int(context.args[1]) if len(context.args) > 1 else None
+
+    import node_manager
+    await update.message.reply_text(
+        f"⏳ Memulai pull model `{model_name}`"
+        + (f" ke node id={node_id}" if node_id else " ke SEMUA node online")
+        + "... Ini bisa memakan waktu lama untuk model besar (bisa puluhan menit).",
+        parse_mode=constants.ParseMode.MARKDOWN,
+    )
+
+    try:
+        if node_id is not None:
+            result = await asyncio.to_thread(node_manager.pull_model_on_node, node_id, model_name)
+            status = "✅ Berhasil" if result.get("success", True) else "❌ Gagal"
+            await update.message.reply_text(
+                f"{status}: `{model_name}` di node id={node_id}\n"
+                f"Status model: `{result.get('model_status', 'unknown')}`",
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        else:
+            results = await asyncio.to_thread(node_manager.pull_model_on_all_nodes, model_name)
+            lines = [f"📦 *Hasil Pull '{model_name}'*\n"]
+            for r in results:
+                if r.get("success"):
+                    lines.append(f"✅ {r['node']}: berhasil ({r.get('elapsed_seconds', '-')}s)")
+                else:
+                    lines.append(f"❌ {r['node']}: {r.get('error', 'gagal')[:100]}")
+            await send_long_message(update, "\n".join(lines))
+    except Exception as exc:
+        logger.exception("Error saat /pullmodel")
+        await update.message.reply_text(f"❌ Gagal melakukan pull: {exc}")
+
+
+async def cmd_unload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /unload <model_name> <node_id>
+    Unload model tertentu dari VRAM node tertentu secara manual (di luar
+    siklus auto-unload idle timeout worker_agent.py). Berguna saat owner mau
+    segera membebaskan VRAM untuk model lain tanpa menunggu idle timeout.
+    """
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("⛔ Perintah ini khusus owner.")
+        return
+
+    err = _require_cluster_mode()
+    if err:
+        await update.message.reply_text(err, parse_mode=constants.ParseMode.MARKDOWN)
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Format: `/unload <nama_model> <node_id>`\n\n"
+            "Contoh: `/unload qwen2.5:32b 1`\n"
+            "Cek node_id lewat perintah /worker.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+        return
+
+    model_name = context.args[0]
+    try:
+        node_id = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ node_id harus berupa angka. Cek node_id lewat /worker.")
+        return
+
+    import node_manager
+    try:
+        result = await asyncio.to_thread(node_manager.unload_model_on_node, node_id, model_name)
+        await update.message.reply_text(
+            f"✅ {result.get('message', f'Model {model_name} berhasil di-unload.')}"
+        )
+    except Exception as exc:
+        logger.exception("Error saat /unload")
+        await update.message.reply_text(f"❌ Gagal unload model: {exc}")
+
+
+async def cmd_modelsync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /modelsync [node_id]
+    Paksa refresh cache daftar model (dan status ready/locked) dari Worker
+    Node. Jika node_id tidak diisi, sync dilakukan ke semua node online.
+    Berguna setelah pull model manual langsung di VPS Worker (di luar bot)
+    supaya bot langsung "tahu" model baru tersedia tanpa menunggu siklus
+    health-check berikutnya.
+    """
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("⛔ Perintah ini khusus owner.")
+        return
+
+    err = _require_cluster_mode()
+    if err:
+        await update.message.reply_text(err, parse_mode=constants.ParseMode.MARKDOWN)
+        return
+
+    import node_manager
+    import database as _db
+
+    node_id = int(context.args[0]) if context.args else None
+    target_nodes = [_db.get_worker_node(node_id)] if node_id else _db.list_worker_nodes(enabled_only=True)
+    target_nodes = [n for n in target_nodes if n]
+
+    if not target_nodes:
+        await update.message.reply_text("❌ Node tidak ditemukan atau belum ada node terdaftar.")
+        return
+
+    lines = ["🔄 *Hasil Sinkronisasi Model*\n"]
+    for node in target_nodes:
+        try:
+            result = await asyncio.to_thread(node_manager.sync_models_from_node, node["id"])
+            lines.append(
+                f"✅ *{node['name']}*: {result['total']} model "
+                f"({result['ready']} ready, {result['locked']} locked)"
+            )
+        except Exception as exc:
+            lines.append(f"❌ *{node['name']}*: gagal sync ({exc})")
+
+    await send_long_message(update, "\n".join(lines))
+
+
+# =========================================================================
 # LIMIT ENFORCEMENT (dipakai sebelum setiap chat/upload diproses)
 # =========================================================================
 
@@ -1201,11 +1309,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     role, tier = u["model_role"], u["model_tier"]
-    lock_reason = _model_lock_reason(role, tier)
-    if lock_reason:
-        await message.reply_text(f"🔒 {lock_reason}\nPilih model yang sesuai hardware lewat /model.")
-        return
-
     model_name = engine.resolve_model(role, tier)
     token = user_token_for(telegram_user.id)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
@@ -1219,11 +1322,26 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # dan user lain tetap bisa dilayani secara bersamaan. ProgressReporter
         # mengedit satu pesan secara berkala selama menunggu (feedback visual).
         async with ProgressReporter(update, context):
-            result = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name, role)
+            result = await asyncio.to_thread(
+                engine.chat, user_message, previous_history, model_name, role, telegram_user.id
+            )
 
         reply_text = result["content"]
         db.save_message(token, "assistant", reply_text)
-        _deduct_tokens_for_tier(telegram_user.id, tier, result["total_tokens"])
+
+        # --- MODEL FALLBACK OTOMATIS: hitung multiplier token sesuai model yang
+        # BENAR-BENAR dipakai (bisa lebih kecil dari model_name yang diminta),
+        # lalu beri tahu user secara transparan model apa yang dipakai. ---
+        actual_model = result.get("model_used", model_name)
+        actual_tier = engine.resolve_tier_from_model(actual_model, tier) if actual_model != model_name else tier
+        _deduct_tokens_for_tier(telegram_user.id, actual_tier, result["total_tokens"])
+
+        if result.get("fallback_occurred"):
+            fallback_note = (
+                f"ℹ️ *Catatan:* model `{model_name}` sedang penuh/tidak tersedia, "
+                f"jawaban ini otomatis menggunakan `{actual_model}` sebagai pengganti."
+            )
+            await update.effective_message.reply_text(fallback_note, parse_mode=constants.ParseMode.MARKDOWN)
 
         await deliver_ai_reply(update, reply_text)
     except engine.AIEngineError as e:
@@ -1263,11 +1381,6 @@ async def _process_and_reply_file(
         return
 
     role, tier = u["model_role"], u["model_tier"]
-    lock_reason = _model_lock_reason(role, tier)
-    if lock_reason:
-        await message.reply_text(f"🔒 {lock_reason}\nPilih model yang sesuai hardware lewat /model.")
-        return
-
     model_name = engine.resolve_model(role, tier)
     token = user_token_for(telegram_user.id)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
@@ -1281,7 +1394,9 @@ async def _process_and_reply_file(
         # Ekstraksi/analisis file (termasuk panggilan vision) juga bisa memakan waktu lama
         # (video/ZIP besar), jalankan di thread terpisah agar bot tetap responsif.
         async with ProgressReporter(update, context):
-            result = await asyncio.to_thread(engine.process_uploaded_file, filename, content)
+            result = await asyncio.to_thread(
+                engine.process_uploaded_file, filename, content, telegram_user.id
+            )
         extracted_text = result["extracted_text"]
 
         caption = (message.caption or "").strip()
@@ -1300,11 +1415,23 @@ async def _process_and_reply_file(
         db.save_message(token, "user", user_message)
 
         async with ProgressReporter(update, context):
-            result_chat = await asyncio.to_thread(engine.chat, user_message, previous_history, model_name, role)
+            result_chat = await asyncio.to_thread(
+                engine.chat, user_message, previous_history, model_name, role, telegram_user.id
+            )
         reply_text = result_chat["content"]
 
         db.save_message(token, "assistant", reply_text)
-        _deduct_tokens_for_tier(telegram_user.id, tier, result_chat["total_tokens"])
+
+        actual_model = result_chat.get("model_used", model_name)
+        actual_tier = engine.resolve_tier_from_model(actual_model, tier) if actual_model != model_name else tier
+        _deduct_tokens_for_tier(telegram_user.id, actual_tier, result_chat["total_tokens"])
+
+        if result_chat.get("fallback_occurred"):
+            fallback_note = (
+                f"ℹ️ *Catatan:* model `{model_name}` sedang penuh/tidak tersedia, "
+                f"jawaban ini otomatis menggunakan `{actual_model}` sebagai pengganti."
+            )
+            await update.effective_message.reply_text(fallback_note, parse_mode=constants.ParseMode.MARKDOWN)
 
         if result["truncated"]:
             await message.reply_text("ℹ️ Catatan: hasil ekstraksi file terpotong karena terlalu panjang.")
@@ -1419,7 +1546,6 @@ def main() -> None:
 
     # Callback query (inline button) handler untuk /model (alur 2 langkah: role -> tier)
     application.add_handler(CallbackQueryHandler(callback_model_role, pattern=r"^model_role:"))
-    application.add_handler(CallbackQueryHandler(callback_model_lock, pattern=r"^model_lock:"))
     application.add_handler(CallbackQueryHandler(callback_model_tier, pattern=r"^model_tier:"))
     application.add_handler(CallbackQueryHandler(callback_model_back, pattern=r"^model_back$"))
 
@@ -1430,6 +1556,14 @@ def main() -> None:
     application.add_handler(CommandHandler("ban", cmd_ban))
     application.add_handler(CommandHandler("unban", cmd_unban))
     application.add_handler(CommandHandler("broadcast", cmd_broadcast))
+
+    # Owner-only: Cluster & Hardware Management (Enterprise)
+    application.add_handler(CommandHandler("hardware", cmd_hardware))
+    application.add_handler(CommandHandler("modelsync", cmd_modelsync))
+    application.add_handler(CommandHandler("pullmodel", cmd_pullmodel))
+    application.add_handler(CommandHandler("unload", cmd_unload))
+    application.add_handler(CommandHandler("worker", cmd_worker))
+    application.add_handler(CommandHandler("queue", cmd_queue))
 
     # File handlers
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))

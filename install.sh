@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 
-# Private AI Telegram Bot - Installer / Updater (v3 - Sistem Role General/Coder + Tier + Token)
+# Enterprise Private AI Telegram Bot - Installer / Updater (v4 - Smart Hardware
+# Cluster: GPU Detection, Auto Pull/Unload, Smart Queue, Model Fallback)
 
 # Instalasi via:
 #   curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/install.sh | sudo bash
 #
-# Sistem target: Ubuntu 20.04/22.04/24.04, RAM 16GB+, CPU 8 Core+
-# Stack: Ollama (5 model: 2 General Chat + 3 Coder/IT + qwen2.5vl vision) + python-telegram-bot (polling) + Systemd
+# Sistem target: Ubuntu 20.04/22.04/24.04, RAM 16GB+, CPU 8 Core+ (Worker Node
+# dengan GPU disarankan untuk model >=14B, lihat worker_agent.py Smart GPU Detection)
+# Stack: Ollama + python-telegram-bot (polling) + FastAPI (Worker Agent & Dashboard) + Systemd
 #
 # Bot berjalan mode POLLING (bukan webhook) sehingga TIDAK butuh domain,
 # TIDAK butuh SSL/certbot, dan TIDAK butuh Nginx. Bot cukup terhubung ke
-# internet untuk polling API Telegram.
+# internet untuk polling API Telegram. Dashboard Web tetap butuh port terbuka
+# (default 8080) jika ingin diakses dari luar VPN/firewall internal.
 #
 # Script ini menyediakan MENU INTERAKTIF:
-#   [1] Install Baru (Fresh Installation)
-#   [2] Update Code & Pull Models (Tanpa Menghapus Database)
+#   [1] Install Baru - Single Server (Ollama + Bot dalam 1 VPS, mode lama)
+#   [2] Update Code & Pull Models - Single Server (Tanpa Menghapus Database)
+#   [3] Install MASTER NODE (Cluster: Bot + Load Balancer + Web Dashboard)
+#   [4] Install WORKER NODE (Cluster: Ollama + Worker Agent + Smart GPU Detection)
 
 
 set -euo pipefail
@@ -57,8 +62,9 @@ ALL_MODELS=(
 # --- Role "extended": katalog 20+ model (CPU-only ringan s/d GPU besar) ---
 # TIDAK di-pull otomatis secara default (banyak model besar & butuh GPU kuat,
 # supaya instalasi standar tetap cepat/ringan). Set PULL_EXTENDED_MODELS=true
-# sebelum menjalankan install.sh, atau jalankan `ollama pull <nama_model>`
-# manual per model yang benar-benar mau dipakai.
+# sebelum menjalankan install.sh, atau gunakan /pullmodel dari Telegram setelah
+# instalasi selesai (Auto Model Pull, lihat worker_agent.py) untuk pull model
+# tertentu saja sesuai kebutuhan & kapasitas VRAM node.
 PULL_EXTENDED_MODELS="${PULL_EXTENDED_MODELS:-false}"
 EXTENDED_MODELS_NO_GPU=(
   "qwen2.5:0.5b" "qwen2.5:1.5b" "tinyllama:1.1b" "gemma2:2b"
@@ -90,12 +96,14 @@ PTB_VERSION_SPEC="python-telegram-bot[all]>=21.0,<22.0"
 PIP_PACKAGES=("${PTB_VERSION_SPEC}" "requests" "pypdf" "python-docx")
 
 # -----------------------------------------------------------------------------
-# DISTRIBUTED CLUSTER ARCHITECTURE (Master-Worker) - KONFIGURASI
+# DISTRIBUTED CLUSTER ARCHITECTURE (Master-Worker) - KONFIGURASI ENTERPRISE
 # -----------------------------------------------------------------------------
-# Master Node : Telegram Bot + Load Balancer (node_manager.py) + Web Dashboard
-#               (master_dashboard.py) + SQLite DB. TIDAK menjalankan Ollama.
-# Worker Node : Ollama + Worker Agent (worker_agent.py), port 3716. Bisa berjumlah
-#               banyak, didaftarkan ke Master lewat Admin Dashboard (/admin).
+# Master Node : Telegram Bot + Smart Load Balancer (node_manager.py) + Web
+#               Dashboard (web_app.py, FastAPI + HTML/JS/CSS terpisah di web/)
+#               + SQLite DB. TIDAK menjalankan Ollama (kecuali Fallback opsional).
+# Worker Node : Ollama + Worker Agent Enterprise (worker_agent.py) dengan Smart
+#               GPU Detection, Auto Pull, Auto Unload, dan Safe Mode -- port 3716.
+#               Bisa berjumlah banyak, didaftarkan ke Master lewat Admin Dashboard.
 WORKER_APP_DIR="/opt/ai-worker"
 WORKER_VENV_DIR="${WORKER_APP_DIR}/venv"
 WORKER_SERVICE_NAME="ai-worker-agent"
@@ -109,7 +117,17 @@ DEFAULT_DASHBOARD_PORT=8080
 FASTAPI_SPEC="fastapi>=0.110,<1.0"
 UVICORN_SPEC="uvicorn[standard]>=0.27,<1.0"
 PIP_PACKAGES_MASTER_EXTRA=("${FASTAPI_SPEC}" "${UVICORN_SPEC}")
+# psutil wajib di Worker Node untuk Smart Hardware Detection (CPU/RAM); GPU
+# terdeteksi lewat nvidia-smi (subprocess, tanpa dependency Python) dengan
+# fallback opsional ke `torch.cuda` jika tersedia (TIDAK di-install otomatis
+# oleh installer ini -- PyTorch besar, worker_agent.py sudah aman tanpa itu).
 PIP_PACKAGES_WORKER=("${FASTAPI_SPEC}" "${UVICORN_SPEC}" "psutil>=5.9,<6.0" "requests")
+
+# Default tuning Worker Agent Enterprise (bisa diedit lewat WORKER_ENV_FILE
+# kapan saja setelah instalasi, tanpa perlu re-run installer):
+DEFAULT_IDLE_UNLOAD_MINUTES=20
+DEFAULT_SAFE_MODE_RAM_THRESHOLD=90
+DEFAULT_SAFE_MODE_VRAM_THRESHOLD=85
 
 # -----------------------------------------------------------------------------
 # WARNA UNTUK OUTPUT TERMINAL
@@ -118,6 +136,7 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
+MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
@@ -125,6 +144,7 @@ log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
+log_gpu()     { echo -e "${MAGENTA}[GPU]${NC} $1"; }
 
 # -----------------------------------------------------------------------------
 # CEK ROOT / SUDO
@@ -145,7 +165,8 @@ else
 fi
 
 echo -e "${BOLD}=============================================${NC}"
-echo -e "${BOLD}  Private AI Telegram Bot - Installer${NC}"
+echo -e "${BOLD}  Enterprise Private AI Telegram Bot - Installer${NC}"
+echo -e "${BOLD}  Smart Hardware Cluster · Zero-OOM · Auto Fallback${NC}"
 echo -e "${BOLD}=============================================${NC}"
 echo ""
 
@@ -155,12 +176,13 @@ echo ""
 echo -e "Pilih mode instalasi:"
 echo -e "  ${GREEN}[1]${NC} Install Baru - Single Server (Ollama + Bot dalam 1 VPS, mode lama)"
 echo -e "  ${GREEN}[2]${NC} Update Code & Pull Models - Single Server (Tanpa Menghapus Database)"
-echo -e "  ${GREEN}[3]${NC} Install MASTER NODE (Cluster: Bot + Load Balancer + Web Dashboard)"
-echo -e "  ${GREEN}[4]${NC} Install WORKER NODE (Cluster: Ollama + Worker Agent, port ${DEFAULT_WORKER_PORT})"
+echo -e "  ${GREEN}[3]${NC} Install MASTER NODE (Cluster: Bot + Smart Load Balancer + Web Dashboard)"
+echo -e "  ${GREEN}[4]${NC} Install WORKER NODE (Cluster: Ollama + Worker Agent + Smart GPU Detection)"
 echo ""
 echo -e "${YELLOW}Catatan:${NC} Pilih [3]/[4] jika ingin menyebar beban AI ke beberapa VPS"
-echo -e "sekaligus (Distributed Cluster Architecture). Pilih [1]/[2] untuk tetap"
-echo -e "memakai 1 VPS saja seperti sebelumnya (Ollama & Bot di server yang sama)."
+echo -e "sekaligus (Distributed Cluster Architecture, dengan Smart Worker Selection,"
+echo -e "Model Fallback otomatis, dan proteksi Zero-OOM). Pilih [1]/[2] untuk tetap"
+echo -e "memakai 1 VPS saja (Ollama & Bot di server yang sama)."
 echo ""
 read -r -p "Masukkan pilihan [1/2/3/4]: " INSTALL_MODE < "${TTY_IN}"
 while [[ "${INSTALL_MODE}" != "1" && "${INSTALL_MODE}" != "2" && "${INSTALL_MODE}" != "3" && "${INSTALL_MODE}" != "4" ]]; do
@@ -191,7 +213,8 @@ install_system_dependencies() {
     sqlite3 \
     ffmpeg \
     curl \
-    git
+    git \
+    pciutils
 
   log_success "Dependencies sistem terinstall."
   echo ""
@@ -213,13 +236,37 @@ install_ollama_if_needed() {
 }
 
 # ---------------------------------------------------------------------------
+# SMART GPU DETECTION (Installer-level) - dipakai untuk menyapa user & memilih
+# strategi resource limit yang tepat SEBELUM Worker Agent berjalan penuh.
+# Deteksi runtime lengkap (VRAM real-time, CUDA version, dst) tetap dilakukan
+# oleh worker_agent.py sendiri saat startup -- fungsi ini hanya level instalasi.
+# ---------------------------------------------------------------------------
+detect_gpu_at_install() {
+  if command -v nvidia-smi &>/dev/null; then
+    local gpu_name gpu_vram
+    gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)"
+    gpu_vram="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1)"
+    if [[ -n "${gpu_name}" ]]; then
+      log_gpu "GPU NVIDIA terdeteksi: ${gpu_name} (${gpu_vram} MB VRAM)."
+      HAS_GPU_AT_INSTALL="true"
+      return 0
+    fi
+  fi
+  log_warn "Tidak ada GPU NVIDIA terdeteksi (nvidia-smi tidak ditemukan/gagal). Node ini akan berjalan CPU-Only."
+  log_warn "Model yang tersedia otomatis dibatasi ke kelas ringan (≤8B) -- lihat Dynamic Model Availability di worker_agent.py."
+  HAS_GPU_AT_INSTALL="false"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # RESOURCE LIMIT OLLAMA (cgroups v2, 70% CPU + 70% RAM) - lihat ollama-limit.conf
 # ---------------------------------------------------------------------------
 # Dipanggil setelah Ollama diinstall di server yang JUGA menjalankan proses lain
 # (Bot/Dashboard) -- yaitu mode Single-Server ([1]) dan mode Master Node dengan
 # opsi "Ollama Fallback" diaktifkan ([3]). TIDAK dipanggil di Worker Node murni
-# ([4]) karena Worker Node memang didedikasikan penuh untuk Ollama saja, jadi
-# tidak perlu dibatasi (justru ingin memakai semua resource yang ada).
+# ([4]) karena Worker Node memang didedikasikan penuh untuk Ollama saja -- Worker
+# Node justru punya proteksi SENDIRI yang lebih pintar (Safe Mode dinamis di
+# worker_agent.py yang bereaksi terhadap RAM/VRAM real-time, bukan cgroups statis).
 apply_ollama_resource_limit() {
   log_info "Menerapkan batas resource Ollama (maks 70% CPU & 70% RAM) agar Bot/Dashboard tidak crash/OOM..."
 
@@ -276,14 +323,14 @@ setup_python_venv() {
 }
 
 migrate_database() {
-  log_info "Menjalankan migrasi database (menambahkan kolom baru jika belum ada)..."
+  log_info "Menjalankan migrasi database (menambahkan kolom baru jika belum ada, termasuk skema hardware Worker Node)..."
   if "${VENV_DIR}/bin/python3" -c "
 import sys
 sys.path.insert(0, '${APP_DIR}')
 import database as db
 db.set_db_path('${APP_DIR}/bot_data.db')
 db.init_db()
-print('Migrasi database selesai (kuota token per-user, model_role + model_tier, redeem token_value siap).')
+print('Migrasi database selesai (kuota token per-user, model_role + model_tier, redeem token_value, worker_nodes hardware, queue_events siap).')
 "; then
     log_success "Migrasi database berhasil. Database & riwayat chat lama tetap aman/tidak terhapus."
   else
@@ -295,22 +342,10 @@ print('Migrasi database selesai (kuota token per-user, model_role + model_tier, 
 
 github_auto_setup() {
   # -----------------------------------------------------------------------
-  # DESAIN BARU (jauh lebih sederhana dari versi sebelumnya):
-  #
-  # Versi lama membuat git repo TAMBAHAN persis di ${APP_DIR} (folder yang
-  # sama dengan clone source code bot), lalu commit+push database.db ke situ
-  # tiap 60 detik. Ini punya 2 bug serius:
-  #   1. Setiap push ikut mengirim SELURUH source code bot (bukan cuma
-  #      database) ke repo backup, dan riwayatnya menumpuk tanpa batas.
-  #   2. Saat menu Update jalan (`git reset --hard origin/main`), commit
-  #      auto-backup tadi ikut ke-reset -> file database bisa TERHAPUS dari
-  #      server, karena secara tidak sengaja "dianggap" bagian dari git
-  #      repo source code.
-  #
-  # Sekarang: backup/restore database TIDAK memakai `git` sama sekali,
-  # murni lewat GitHub REST API (curl), dan disimpan terpisah total dari
-  # git repo source code bot. Auto-backup rutin tiap 60 detik dilakukan
-  # oleh bot.py lewat modul github_backup.py (Python), bukan oleh script ini.
+  # Backup/restore database TIDAK memakai `git` sama sekali, murni lewat
+  # GitHub REST API (curl/python), dan disimpan terpisah total dari git repo
+  # source code bot. Auto-backup rutin tiap 60 detik dilakukan oleh bot.py
+  # lewat modul github_backup.py (Python), bukan oleh script ini.
   # -----------------------------------------------------------------------
   echo -e "${BOLD}=================================================================${NC}"
   echo -e "${BOLD}   GITHUB BACKUP & RESTORE DATABASE (OTOMATIS)${NC}"
@@ -373,11 +408,6 @@ github_auto_setup() {
     "https://api.github.com/repos/${GH_BACKUP_REPO}/contents/${GH_BACKUP_PATH}?ref=${GH_BACKUP_BRANCH}")"
 
   if [[ "${GH_RESTORE_STATUS}" == "200" ]]; then
-    # Parsing JSON + decode base64 + gunzip dilakukan lewat python3 (bukan
-    # grep/sed) karena field "content" dari GitHub adalah base64 yang berisi
-    # escape newline literal ("\n") di dalam string JSON — python's json
-    # module & base64.b64decode menangani ini dengan benar, sedangkan
-    # grep/sed/tr gampang salah dan menghasilkan file korup.
     if python3 - "${GH_RESTORE_JSON}" "${APP_DIR}/${DB_FILE_NAME}" <<'PYEOF'
 import base64
 import gzip
@@ -404,8 +434,6 @@ PYEOF
 
   GH_BACKUP_ENABLED="true"
 
-  # Tulis/perbarui baris GH_BACKUP_* di .env jika file sudah ada (mode Update);
-  # untuk fresh install, baris ini juga ditulis ulang oleh blok cat > .env utama.
   if [[ -f "${ENV_FILE}" ]]; then
     umask 077
     sed -i '/^GH_BACKUP_ENABLED=/d;/^GH_BACKUP_PAT=/d;/^GH_BACKUP_REPO=/d;/^GH_BACKUP_BRANCH=/d;/^GH_BACKUP_PATH=/d' "${ENV_FILE}"
@@ -426,7 +454,7 @@ setup_systemd_service() {
 
   cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Private AI Telegram Bot
+Description=Enterprise Private AI Telegram Bot
 After=network-online.target ollama.service
 Wants=network-online.target ollama.service
 
@@ -483,7 +511,7 @@ EOF
 print_footer() {
   echo ""
   echo -e "${GREEN}${BOLD}=================================================================${NC}"
-  echo -e "${GREEN}${BOLD}   SELESAI - PRIVATE AI TELEGRAM BOT SIAP DIGUNAKAN${NC}"
+  echo -e "${GREEN}${BOLD}   SELESAI - ENTERPRISE PRIVATE AI TELEGRAM BOT SIAP DIGUNAKAN${NC}"
   echo -e "${GREEN}${BOLD}=================================================================${NC}"
   echo ""
   echo -e "${BLUE}${BOLD}1. CARA MENGAKSES BOT${NC}"
@@ -519,6 +547,8 @@ print_footer() {
   echo -e "   ${YELLOW}/ban <id>${NC}           — nonaktifkan akses user tertentu"
   echo -e "   ${YELLOW}/unban <id>${NC}         — aktifkan kembali akses user"
   echo -e "   ${YELLOW}/broadcast <pesan>${NC}  — kirim pesan ke semua user terdaftar"
+  echo -e "   ${YELLOW}(Catatan: /hardware, /worker, /queue, /pullmodel, /unload, /modelsync${NC}"
+  echo -e "   ${YELLOW}hanya aktif di mode Cluster (Master Node) — lihat opsi [3]/[4] di installer ini)${NC}"
   echo ""
   echo -e "${BLUE}${BOLD}4. KONFIGURASI BOT (TOKEN & OWNER ID)${NC}"
   echo -e "   a. Edit file rahasia (BUKAN bot.py):"
@@ -555,7 +585,8 @@ print_footer() {
     echo ""
   fi
   echo -e "${BLUE}${BOLD}8. CARA UPDATE DI MASA DEPAN${NC}"
-  echo -e "   Jalankan ulang installer ini dan pilih menu ${GREEN}[2] Update${NC}."
+  echo -e "   Jalankan ulang installer ini dan pilih menu ${GREEN}[2] Update${NC}, atau pakai"
+  echo -e "   updater mandiri: ${GREEN}sudo bash update.sh${NC} (auto-detect Single/Master/Worker)."
   echo -e "   Proses ini akan: git pull, update dependency Python, migrasi kolom DB baru"
   echo -e "   (tanpa menghapus data), pull model baru jika belum ada, lalu restart service."
   echo ""
@@ -589,10 +620,6 @@ run_update_flow() {
   if [[ -d "${APP_DIR}/.git" ]]; then
     log_info "Menjalankan git pull di ${APP_DIR}..."
     git config --global --add safe.directory "${APP_DIR}" || true
-    # Catatan: backup database (github_auto_setup) TIDAK PERNAH memakai git
-    # sama sekali (lihat github_backup.py), jadi repo ${APP_DIR} ini murni
-    # berisi source code bot. `reset --hard` di bawah aman dan tidak akan
-    # pernah menyentuh bot_data.db (file itu untracked / ada di .gitignore).
     if git -C "${APP_DIR}" remote get-url origin &>/dev/null; then
       git -C "${APP_DIR}" remote set-url origin "${REPO_GIT_URL}"
     else
@@ -609,6 +636,7 @@ run_update_flow() {
     cp -f "${TMP_CLONE}/bot.py" "${APP_DIR}/bot.py"
     cp -f "${TMP_CLONE}/ai_engine.py" "${APP_DIR}/ai_engine.py"
     cp -f "${TMP_CLONE}/database.py" "${APP_DIR}/database.py"
+    cp -f "${TMP_CLONE}/github_backup.py" "${APP_DIR}/github_backup.py" 2>/dev/null || true
     rm -rf "${TMP_CLONE}"
     log_success "Source code berhasil diperbarui."
   fi
@@ -644,6 +672,7 @@ run_fresh_install_flow() {
   echo ""
 
   install_system_dependencies
+  detect_gpu_at_install || true
   install_ollama_if_needed
   pull_all_models
   apply_ollama_resource_limit
@@ -654,7 +683,7 @@ run_fresh_install_flow() {
     useradd --system --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
   fi
 
-  # CLONE REPOSITORY (bot.py, ai_engine.py, database.py)
+  # CLONE REPOSITORY (bot.py, ai_engine.py, database.py, dst)
   log_info "Menyiapkan direktori aplikasi di ${APP_DIR}..."
   if [[ -d "${APP_DIR}" ]]; then
     log_warn "${APP_DIR} sudah ada. File .env (jika ada) akan tetap dipertahankan."
@@ -776,13 +805,13 @@ print('OK - python-telegram-bot versi', telegram.__version__)
 }
 
 # =============================================================================
-# CLUSTER: MASTER NODE (Bot + Load Balancer + Web Dashboard, TANPA Ollama lokal)
+# CLUSTER: MASTER NODE (Bot + Smart Load Balancer + Web Dashboard, TANPA Ollama lokal)
 # =============================================================================
 setup_master_bot_systemd() {
   log_info "Membuat/memperbarui systemd service '${SERVICE_NAME}' (Master - Telegram Bot)..."
   cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Private AI Telegram Bot - Master Node
+Description=Enterprise AI Telegram Bot - Master Node (Smart Load Balancer)
 After=network-online.target
 Wants=network-online.target
 
@@ -825,10 +854,10 @@ EOF
 }
 
 setup_master_dashboard_systemd() {
-  log_info "Membuat/memperbarui systemd service '${DASHBOARD_SERVICE_NAME}' (Web Dashboard)..."
+  log_info "Membuat/memperbarui systemd service '${DASHBOARD_SERVICE_NAME}' (Web Dashboard, FastAPI + web/ statis)..."
   cat > "/etc/systemd/system/${DASHBOARD_SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Private AI Telegram Bot - Cluster Dashboard (Master Node)
+Description=Enterprise AI Telegram Bot - Cluster Dashboard (Master Node)
 After=network-online.target ${SERVICE_NAME}.service
 Wants=network-online.target
 
@@ -839,7 +868,7 @@ Group=${SERVICE_USER}
 WorkingDirectory=${APP_DIR}
 Environment="DB_PATH=${APP_DIR}/bot_data.db"
 EnvironmentFile=${ENV_FILE}
-ExecStart=${VENV_DIR}/bin/uvicorn master_dashboard:app --host 0.0.0.0 --port ${DASHBOARD_PORT_INPUT}
+ExecStart=${VENV_DIR}/bin/uvicorn web_app:app --host 0.0.0.0 --port ${DASHBOARD_PORT_INPUT}
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -871,7 +900,7 @@ print_master_footer() {
   SERVER_IP_HINT="$(curl -s --max-time 3 https://api.ipify.org || echo '<IP-VPS-Anda>')"
   echo ""
   echo -e "${GREEN}${BOLD}=================================================================${NC}"
-  echo -e "${GREEN}${BOLD}   MASTER NODE SIAP - CLUSTER DISTRIBUTED ARCHITECTURE${NC}"
+  echo -e "${GREEN}${BOLD}   MASTER NODE SIAP - ENTERPRISE CLUSTER ARCHITECTURE${NC}"
   echo -e "${GREEN}${BOLD}=================================================================${NC}"
   echo ""
   echo -e "${BLUE}${BOLD}1. TELEGRAM BOT${NC}"
@@ -879,25 +908,35 @@ print_master_footer() {
   echo -e "   ${YELLOW}TIDAK ADA Worker Node terdaftar sampai Anda menambahkannya${NC} (langkah 3)."
   echo ""
   echo -e "${BLUE}${BOLD}2. WEB DASHBOARD (Status Publik + Admin)${NC}"
-  echo -e "   Status publik cluster : ${GREEN}http://${SERVER_IP_HINT}:${DASHBOARD_PORT_INPUT}/${NC}"
-  echo -e "   Admin panel (kelola node) : ${GREEN}http://${SERVER_IP_HINT}:${DASHBOARD_PORT_INPUT}/admin${NC}"
+  echo -e "   Status publik cluster (mission-control view) : ${GREEN}http://${SERVER_IP_HINT}:${DASHBOARD_PORT_INPUT}/${NC}"
+  echo -e "   Admin panel (kelola node, pull/unload model)  : ${GREEN}http://${SERVER_IP_HINT}:${DASHBOARD_PORT_INPUT}/admin${NC}"
   echo -e "   Login admin : ${GREEN}${ADMIN_USERNAME_INPUT}${NC} / (password sesuai input Anda tadi)"
   echo -e "   ${YELLOW}Buka port ${DASHBOARD_PORT_INPUT}/tcp di firewall/security-group VPS ini.${NC}"
   echo ""
   echo -e "${BLUE}${BOLD}3. MENAMBAHKAN WORKER NODE${NC}"
-  echo -e "   a. Jalankan installer ini di VPS lain, pilih ${GREEN}[4] Install Worker Node${NC}."
+  echo -e "   a. Jalankan installer ini di VPS lain (idealnya dengan GPU), pilih ${GREEN}[4] Install Worker Node${NC}."
   echo -e "   b. Catat IP VPS worker, port (default ${DEFAULT_WORKER_PORT}), dan API Key yang"
   echo -e "      ditampilkan di akhir instalasi worker tsb."
-  echo -e "   c. Buka Admin Dashboard di atas -> isi form 'Tambah Worker Node Baru' -> Submit."
+  echo -e "   c. Buka Admin Dashboard di atas -> isi form 'Tambah Worker Node' -> Submit."
   echo -e "   d. Node akan online otomatis dalam ${GREEN}~7 detik${NC} (health-check berkala),"
   echo -e "      TANPA perlu restart Telegram Bot maupun Dashboard."
   echo ""
-  echo -e "${BLUE}${BOLD}4. LOAD BALANCING${NC}"
+  echo -e "${BLUE}${BOLD}4. SMART WORKER SELECTION & MODEL FALLBACK${NC}"
   echo -e "   Setiap chat/analisis gambar-video dari user dirutekan otomatis ke Worker Node"
-  echo -e "   yang paling sedikit beban (active_tasks, lalu CPU/RAM). Jika node yang dipilih"
-  echo -e "   gagal/timeout, request otomatis failover ke node berikutnya."
+  echo -e "   terbaik berdasarkan: ketersediaan model (ready/locked), sisa VRAM, load CPU/RAM,"
+  echo -e "   dan slot antrian model tsb. Jika model yang diminta penuh di semua node, sistem"
+  echo -e "   otomatis FALLBACK ke model lebih kecil dan memberi tahu user secara transparan."
+  echo -e "   Jika node yang dipilih gagal di tengah jalan, request otomatis failover ke node lain."
   echo ""
-  echo -e "${BLUE}${BOLD}5. LOG & SERVICE${NC}"
+  echo -e "${BLUE}${BOLD}5. PERINTAH ADMIN CLUSTER (khusus owner, di Telegram)${NC}"
+  echo -e "   ${YELLOW}/hardware${NC}   — spek GPU/VRAM/CPU/RAM semua Worker Node"
+  echo -e "   ${YELLOW}/worker${NC}     — ringkasan status cluster (online/offline, model ready/locked)"
+  echo -e "   ${YELLOW}/queue${NC}      — antrian aktif + histori event (queued/fallback/failed)"
+  echo -e "   ${YELLOW}/pullmodel${NC}  — pull model baru ke satu/semua Worker Node"
+  echo -e "   ${YELLOW}/unload${NC}     — unload model tertentu dari VRAM node tertentu"
+  echo -e "   ${YELLOW}/modelsync${NC}  — paksa refresh cache model dari Worker Node"
+  echo ""
+  echo -e "${BLUE}${BOLD}6. LOG & SERVICE${NC}"
   echo -e "   Log bot        : ${GREEN}sudo journalctl -u ${SERVICE_NAME} -f${NC}"
   echo -e "   Log dashboard  : ${GREEN}sudo journalctl -u ${DASHBOARD_SERVICE_NAME} -f${NC}"
   echo -e "   Restart bot    : ${GREEN}sudo systemctl restart ${SERVICE_NAME}${NC}"
@@ -914,11 +953,11 @@ print_master_footer() {
 
 install_master_node_flow() {
   echo -e "${BOLD}=================================================================${NC}"
-  echo -e "${BOLD}   INSTALL MASTER NODE (CLUSTER DISTRIBUTED ARCHITECTURE)${NC}"
+  echo -e "${BOLD}   INSTALL MASTER NODE (ENTERPRISE CLUSTER ARCHITECTURE)${NC}"
   echo -e "${BOLD}=================================================================${NC}"
   echo ""
-  echo -e "Master Node menjalankan: Telegram Bot, Load Balancer (node_manager.py),"
-  echo -e "Web Dashboard (status publik + admin), dan database SQLite."
+  echo -e "Master Node menjalankan: Telegram Bot, Smart Load Balancer (node_manager.py),"
+  echo -e "Web Dashboard (web_app.py, FastAPI + HTML/JS/CSS statis di web/), dan database SQLite."
   echo -e "${YELLOW}Secara default, Ollama TIDAK diinstall di sini${NC} -- AI generation"
   echo -e "dijalankan oleh Worker Node yang Anda daftarkan lewat Admin Dashboard nanti."
   echo ""
@@ -969,6 +1008,10 @@ install_master_node_flow() {
   fi
   if [[ -d "${APP_DIR}/.git" ]]; then
     { echo ".env"; echo "${DB_FILE_NAME}"; echo "${DB_FILE_NAME}.gz"; echo "venv/"; } > "${APP_DIR}/.git/info/exclude"
+  fi
+  if [[ ! -d "${APP_DIR}/web" ]]; then
+    log_error "Folder web/ (index.html, admin.html, style.css, dashboard.js, admin.js) tidak ditemukan di repo."
+    log_error "Web Dashboard TIDAK akan berfungsi tanpa folder ini. Periksa isi repo Anda."
   fi
   log_success "File aplikasi Master Node siap."
   echo ""
@@ -1047,8 +1090,8 @@ EOF
   if "${VENV_DIR}/bin/python3" -c "
 import sys
 sys.path.insert(0, '${APP_DIR}')
-import telegram, database, ai_engine, node_manager, master_dashboard
-print('OK - modul Master Node lengkap (bot + node_manager + dashboard).')
+import telegram, database, ai_engine, node_manager, web_app
+print('OK - modul Master Node lengkap (bot + node_manager + web_app dashboard).')
 "; then
     log_success "Validasi modul Master berhasil."
   else
@@ -1063,13 +1106,13 @@ print('OK - modul Master Node lengkap (bot + node_manager + dashboard).')
 }
 
 # =============================================================================
-# CLUSTER: WORKER NODE (Ollama + Worker Agent, port 3716)
+# CLUSTER: WORKER NODE (Ollama + Worker Agent Enterprise, port 3716)
 # =============================================================================
 setup_worker_systemd() {
   log_info "Membuat/memperbarui systemd service '${WORKER_SERVICE_NAME}'..."
   cat > "/etc/systemd/system/${WORKER_SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=AI Bot Cluster - Worker Node Agent
+Description=Enterprise AI Bot Cluster - Worker Node Agent (Smart GPU/Hardware Management)
 After=network-online.target ollama.service
 Wants=network-online.target ollama.service
 
@@ -1111,8 +1154,16 @@ print_worker_footer() {
   SERVER_IP_HINT="$(curl -s --max-time 3 https://api.ipify.org || echo '<IP-VPS-Anda>')"
   echo ""
   echo -e "${GREEN}${BOLD}=================================================================${NC}"
-  echo -e "${GREEN}${BOLD}   WORKER NODE SIAP${NC}"
+  echo -e "${GREEN}${BOLD}   WORKER NODE SIAP (SMART HARDWARE MANAGEMENT AKTIF)${NC}"
   echo -e "${GREEN}${BOLD}=================================================================${NC}"
+  echo ""
+  if [[ "${HAS_GPU_AT_INSTALL:-false}" == "true" ]]; then
+    echo -e "${MAGENTA}${BOLD}GPU TERDETEKSI${NC} — Dynamic Model Availability aktif: model hingga kelas"
+    echo -e "sesuai VRAM node ini akan berstatus 'Ready', sisanya 'Locked' otomatis."
+  else
+    echo -e "${YELLOW}${BOLD}CPU-ONLY${NC} — hanya model ≤8B yang berstatus 'Ready' di node ini."
+    echo -e "Pasang GPU NVIDIA + driver, lalu restart service ini untuk membuka model lebih besar."
+  fi
   echo ""
   echo -e "Daftarkan node ini di Admin Dashboard Master Node dengan data berikut:"
   echo ""
@@ -1123,6 +1174,15 @@ print_worker_footer() {
   echo -e "${YELLOW}Simpan API Key di atas -- tidak ditampilkan ulang secara otomatis.${NC}"
   echo -e "${YELLOW}Buka port ${WORKER_PORT_INPUT}/tcp di firewall/security-group VPS ini${NC}"
   echo -e "${YELLOW}(hanya perlu bisa diakses dari IP Master Node, idealnya dibatasi lewat firewall).${NC}"
+  echo ""
+  echo -e "${BLUE}${BOLD}FITUR ENTERPRISE AKTIF DI NODE INI${NC}"
+  echo -e "   ✓ Smart GPU Detection    — nvidia-smi + fallback torch.cuda, VRAM real-time"
+  echo -e "   ✓ Dynamic Model Lock     — model dikunci/dibuka otomatis sesuai VRAM tersedia"
+  echo -e "   ✓ Auto Pull & Cache      — model baru bisa ditarik lewat /pullmodel dari Telegram"
+  echo -e "   ✓ Auto Unload Idle       — model idle > ${DEFAULT_IDLE_UNLOAD_MINUTES} menit otomatis dilepas dari VRAM"
+  echo -e "   ✓ Safe Mode              — RAM≥${DEFAULT_SAFE_MODE_RAM_THRESHOLD}%% / VRAM≥${DEFAULT_SAFE_MODE_VRAM_THRESHOLD}%% otomatis kunci model besar"
+  echo -e "   ✓ Smart Queue Limiter    — batas concurrent per ukuran model (cegah OOM/Kernel Panic)"
+  echo -e "   (semua threshold di atas bisa diedit di ${WORKER_ENV_FILE})"
   echo ""
   echo -e "${BLUE}${BOLD}Model yang sudah di-pull di node ini:${NC}"
   for model in "${ALL_MODELS[@]}"; do
@@ -1139,14 +1199,16 @@ print_worker_footer() {
 
 install_worker_node_flow() {
   echo -e "${BOLD}=================================================================${NC}"
-  echo -e "${BOLD}   INSTALL WORKER NODE (CLUSTER DISTRIBUTED ARCHITECTURE)${NC}"
+  echo -e "${BOLD}   INSTALL WORKER NODE (ENTERPRISE CLUSTER, SMART HARDWARE MGMT)${NC}"
   echo -e "${BOLD}=================================================================${NC}"
   echo ""
-  echo -e "Worker Node menjalankan: Ollama + Worker Agent (FastAPI, port ${DEFAULT_WORKER_PORT})."
+  echo -e "Worker Node menjalankan: Ollama + Worker Agent Enterprise (FastAPI, port ${DEFAULT_WORKER_PORT})"
+  echo -e "dengan Smart GPU Detection, Auto Pull/Unload, dan Safe Mode bawaan."
   echo -e "Setelah instalasi selesai, daftarkan node ini ke Master Node lewat Admin Dashboard."
   echo ""
 
   install_system_dependencies
+  detect_gpu_at_install || true
   install_ollama_if_needed
   pull_all_models
 
@@ -1182,6 +1244,15 @@ install_worker_node_flow() {
 
   read -r -p "Port Worker Agent [default: ${DEFAULT_WORKER_PORT}]: " WORKER_PORT_INPUT < "${TTY_IN}"
   WORKER_PORT_INPUT="${WORKER_PORT_INPUT:-${DEFAULT_WORKER_PORT}}"
+
+  echo ""
+  echo -e "${BOLD}--- Tuning Enterprise (opsional, tekan Enter untuk pakai default) ---${NC}"
+  read -r -p "Auto-Unload idle timeout dalam menit [default: ${DEFAULT_IDLE_UNLOAD_MINUTES}]: " IDLE_UNLOAD_INPUT < "${TTY_IN}"
+  IDLE_UNLOAD_INPUT="${IDLE_UNLOAD_INPUT:-${DEFAULT_IDLE_UNLOAD_MINUTES}}"
+  read -r -p "Safe Mode RAM threshold %% [default: ${DEFAULT_SAFE_MODE_RAM_THRESHOLD}]: " SAFE_RAM_INPUT < "${TTY_IN}"
+  SAFE_RAM_INPUT="${SAFE_RAM_INPUT:-${DEFAULT_SAFE_MODE_RAM_THRESHOLD}}"
+  read -r -p "Safe Mode VRAM threshold %% [default: ${DEFAULT_SAFE_MODE_VRAM_THRESHOLD}]: " SAFE_VRAM_INPUT < "${TTY_IN}"
+  SAFE_VRAM_INPUT="${SAFE_VRAM_INPUT:-${DEFAULT_SAFE_MODE_VRAM_THRESHOLD}}"
   echo ""
 
   log_info "Menyimpan konfigurasi ke ${WORKER_ENV_FILE}..."
@@ -1192,6 +1263,10 @@ WORKER_API_KEY=${WORKER_API_KEY_INPUT}
 OLLAMA_HOST=http://127.0.0.1:11434
 OLLAMA_NUM_CTX=2048
 WORKER_REQUEST_TIMEOUT_SECONDS=600
+# --- Enterprise tuning: Auto-Unload & Safe Mode (lihat worker_agent.py) ---
+IDLE_UNLOAD_MINUTES=${IDLE_UNLOAD_INPUT}
+SAFE_MODE_RAM_THRESHOLD=${SAFE_RAM_INPUT}
+SAFE_MODE_VRAM_THRESHOLD=${SAFE_VRAM_INPUT}
 EOF
   chmod 600 "${WORKER_ENV_FILE}"
   chown -R "${WORKER_SERVICE_USER}:${WORKER_SERVICE_USER}" "${WORKER_APP_DIR}"

@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 
-# update.sh - Smart Updater untuk Private AI Telegram Bot (Single-Server, Master, & Worker Node)
+# update.sh - Smart Updater untuk Enterprise Private AI Telegram Bot (Single-Server, Master, & Worker Node)
 # =================================================================================================
 # Berbeda dari `install.sh` (yang punya mode [2] Update tapi HARUS dijalankan lewat menu
 # interaktif dan mengasumsikan APP_DIR="/opt/ai-bot"), script ini adalah updater MANDIRI
 # yang bisa dijalankan kapan saja tanpa menu, otomatis MENDETEKSI jenis instalasi yang
 # ada di server (Single-Server / Master Node / Worker Node) lewat cek direktori, lalu
-# melakukan `git pull` HANYA pada source code, sambil menjamin file-file berikut TIDAK
-# PERNAH tertimpa atau terhapus:
-#   - .env                     (token bot, ID owner, kredensial dashboard, dll)
-#   - bot_data.db*              (database SQLite + WAL/SHM, riwayat chat & user)
+# melakukan `git pull` HANYA pada source code (termasuk folder web/ untuk Dashboard),
+# sambil menjamin file-file berikut TIDAK PERNAH tertimpa atau terhapus:
+#   - .env                     (token bot, ID owner, kredensial dashboard, API key worker, dll)
+#   - bot_data.db*              (database SQLite + WAL/SHM, riwayat chat, user, worker registry)
 #   - *.pem, *.crt, *.key, ssl/  (sertifikat SSL jika ada, mis. untuk webhook custom)
+#
+# Setelah source code diperbarui, updater ini JUGA otomatis:
+#   - Menjalankan migrasi skema database (kolom hardware/queue baru -- lihat database.py)
+#   - Menarik model Ollama baru yang mungkin ditambahkan di rilis ini (Auto Model Pull)
+#   - Merestart HANYA service yang benar-benar ada di server ini
 #
 # CARA PAKAI:
 #   curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/update.sh | sudo bash
@@ -152,9 +157,13 @@ update_app_dir() {
     tmp_clone="$(mktemp -d)"
     git clone --branch "${REPO_BRANCH}" --depth 1 "${REPO_GIT_URL}" "${tmp_clone}"
     find "${tmp_clone}" -maxdepth 1 -type f -name "*.py" -exec cp -f {} "${app_dir}/" \;
+    find "${tmp_clone}" -maxdepth 1 -type f -name "*.conf" -exec cp -f {} "${app_dir}/" \;
+    # Folder web/ (index.html, admin.html, style.css, dashboard.js, admin.js) untuk
+    # web_app.py (Master Dashboard) -- hanya relevan di Master Node, tapi aman
+    # disalin di semua jenis instalasi (tidak dipakai jika web_app.py tidak dijalankan).
     [[ -d "${tmp_clone}/web" ]] && cp -rf "${tmp_clone}/web" "${app_dir}/"
     rm -rf "${tmp_clone}"
-    log_success "Source code berhasil disalin ke ${app_dir}."
+    log_success "Source code berhasil disalin ke ${app_dir} (termasuk node_manager.py, web_app.py, worker_agent.py, folder web/ jika relevan)."
   fi
 
   restore_preserved_files "${app_dir}" "${backup_dir}"
@@ -281,9 +290,10 @@ fi
 echo -e "${GREEN}${BOLD}=================================================================${NC}"
 echo -e "${GREEN}${BOLD}   UPDATE SELESAI${NC}"
 echo -e "${GREEN}${BOLD}=================================================================${NC}"
-echo -e "Konfigurasi (.env), database, dan sertifikat SSL (jika ada) TIDAK diubah."
+echo -e "Konfigurasi (.env), database (termasuk registry Worker Node & histori antrian),"
+echo -e "dan sertifikat SSL (jika ada) TIDAK diubah."
 echo -e "Cek log service jika ada yang mencurigakan:"
-[[ -d "${MASTER_APP_DIR}" ]] && echo -e "  ${GREEN}sudo journalctl -u ${MASTER_SERVICE_NAME} -f${NC}"
-[[ -d "${MASTER_APP_DIR}" ]] && echo -e "  ${GREEN}sudo journalctl -u ${DASHBOARD_SERVICE_NAME} -f${NC}"
-[[ -d "${WORKER_APP_DIR}" ]] && echo -e "  ${GREEN}sudo journalctl -u ${WORKER_SERVICE_NAME} -f${NC}"
+[[ -d "${MASTER_APP_DIR}" ]] && echo -e "  ${GREEN}sudo journalctl -u ${MASTER_SERVICE_NAME} -f${NC}          (Telegram Bot)"
+[[ -d "${MASTER_APP_DIR}" ]] && echo -e "  ${GREEN}sudo journalctl -u ${DASHBOARD_SERVICE_NAME} -f${NC}   (Web Dashboard, web_app.py)"
+[[ -d "${WORKER_APP_DIR}" ]] && echo -e "  ${GREEN}sudo journalctl -u ${WORKER_SERVICE_NAME} -f${NC}   (Worker Agent, GPU/VRAM/Safe Mode)"
 echo ""

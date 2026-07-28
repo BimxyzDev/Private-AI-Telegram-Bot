@@ -392,80 +392,19 @@ def resolve_model(role: Optional[str], tier: Optional[str]) -> str:
     return tiers_for_role[tier]
 
 
-# Cache daftar model lokal agar request /api/tags tidak dipanggil terus-menerus.
-_LOCAL_MODEL_CACHE: Optional[set[str]] = None
-MODEL_PULL_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_PULL_TIMEOUT", "1800"))
-
-
-def _refresh_local_model_cache() -> set[str]:
-    """Ambil ulang daftar model lokal dari Ollama dan simpan ke cache proses."""
-    global _LOCAL_MODEL_CACHE
-    url = f"{OLLAMA_HOST}/api/tags"
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json() if resp.content else {}
-        models = {
-            item.get("name")
-            for item in data.get("models", [])
-            if isinstance(item, dict) and item.get("name")
-        }
-        _LOCAL_MODEL_CACHE = models
-        return models
-    except Exception as exc:
-        logger.warning("Gagal membaca daftar model lokal dari Ollama (%s): %s", url, exc)
-        if _LOCAL_MODEL_CACHE is None:
-            _LOCAL_MODEL_CACHE = set()
-        return _LOCAL_MODEL_CACHE
-
-
-def ensure_model_ready(model_name: str, auto_pull: bool = True) -> bool:
-    """Pastikan model tersedia secara lokal; jika belum ada, pull otomatis."""
-    local_models = _refresh_local_model_cache()
-    if model_name in local_models:
-        return True
-
-    if not auto_pull:
-        return False
-
-    if shutil.which("ollama") is None:
-        raise AIEngineError(
-            f"Ollama CLI tidak tersedia saat mencoba memuat model {model_name}.",
-            f"Model '{model_name}' belum tersedia dan Ollama CLI tidak ditemukan untuk auto-pull.",
-        )
-
-    try:
-        pull_proc = subprocess.run(
-            ["ollama", "pull", model_name],
-            capture_output=True,
-            text=True,
-            timeout=MODEL_PULL_TIMEOUT_SECONDS if MODEL_PULL_TIMEOUT_SECONDS > 0 else None,
-        )
-    except subprocess.TimeoutExpired:
-        raise AIEngineError(
-            f"Auto-pull model '{model_name}' timeout.",
-            f"Auto-pull model '{model_name}' melebihi batas waktu. Coba lagi nanti.",
-        )
-    except Exception as exc:
-        raise AIEngineError(
-            str(exc),
-            f"Gagal menjalankan auto-pull untuk model '{model_name}'.",
-        )
-
-    if pull_proc.returncode != 0:
-        stderr = (pull_proc.stderr or "").strip()
-        stdout = (pull_proc.stdout or "").strip()
-        detail = stderr or stdout or f"ollama pull {model_name} gagal"
-        raise AIEngineError(
-            detail,
-            f"Auto-pull model '{model_name}' gagal. Detail: {detail[:200]}",
-        )
-
-    # Refresh cache setelah pull sukses agar request berikutnya langsung lolos.
-    local_models = _refresh_local_model_cache()
-    if model_name not in local_models:
-        logger.warning("Model '%s' selesai dipull tetapi belum muncul di daftar lokal.", model_name)
-    return True
+def resolve_tier_from_model(model_name: str, fallback_tier: str) -> str:
+    """
+    Cari tier yang cocok dengan nama model tertentu (dipakai setelah Smart Fallback
+    cluster mengganti model user, supaya perhitungan multiplier token TETAP akurat
+    sesuai model yang BENAR-BENAR dipakai, bukan model yang awalnya diminta).
+    Jika tidak ditemukan kecocokan persis di ROLE_TIERS manapun, kembalikan
+    fallback_tier (tier asal user) sebagai perkiraan teraman.
+    """
+    for role_tiers in ROLE_TIERS.values():
+        for tier, name in role_tiers.items():
+            if name == model_name:
+                return tier
+    return fallback_tier
 
 
 def build_system_prompt(role: Optional[str]) -> str:
@@ -553,18 +492,21 @@ def extract_text_from_file(filename: str, content: bytes) -> str:
 # VISION: ANALISIS GAMBAR VIA OLLAMA (qwen2.5vl)
 # =========================================================================
 
-def call_ollama_vision(image_bytes: bytes, prompt: str) -> str:
+def call_ollama_vision(image_bytes: bytes, prompt: str, telegram_id: Optional[int] = None) -> str:
     """Mengirim satu gambar (raw bytes) + prompt teks ke model vision Ollama."""
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
     if CLUSTER_MODE == "master":
-        return _call_cluster_vision(image_b64, prompt)
+        return _call_cluster_vision(image_b64, prompt, telegram_id=telegram_id)
     return _call_local_ollama_vision(image_b64, prompt)
 
 
-def _call_cluster_vision(image_b64: str, prompt: str) -> str:
+def _call_cluster_vision(image_b64: str, prompt: str, telegram_id: Optional[int] = None) -> str:
     """
-    Mode 'master': route request vision ke Worker Node lewat node_manager.py.
+    Mode 'master': route request vision ke Worker Node lewat node_manager.py
+    (Smart Worker Selection). Vision TIDAK memakai Model Fallback Chain (model
+    vision biasanya satu-satunya di cluster, fallback ke model non-vision tidak
+    relevan) -- allow_fallback=False secara eksplisit.
     Jika SEMUA Worker Node gagal DAN MASTER_OLLAMA_FALLBACK aktif, dicoba
     sekali lagi lewat Ollama lokal di Master Node sendiri sebelum menyerah.
     """
@@ -576,6 +518,8 @@ def _call_cluster_vision(image_b64: str, prompt: str) -> str:
             prompt=prompt,
             images=[image_b64],
             options={"num_ctx": DEFAULT_NUM_CTX},
+            telegram_id=telegram_id,
+            allow_fallback=False,
         )
         return result["content"]
     except node_manager.NoAvailableWorkerError as e:
@@ -599,7 +543,6 @@ def _call_cluster_vision(image_b64: str, prompt: str) -> str:
 
 
 def _call_local_ollama_vision(image_b64: str, prompt: str) -> str:
-    ensure_model_ready(OLLAMA_VISION_MODEL)
     url = f"{OLLAMA_HOST}/api/generate"
 
     payload = {
@@ -639,12 +582,12 @@ def _call_local_ollama_vision(image_b64: str, prompt: str) -> str:
         raise AIEngineError(str(e), f"Error tak terduga saat analisis gambar: {e}")
 
 
-def analyze_image(filename: str, content: bytes) -> str:
+def analyze_image(filename: str, content: bytes, telegram_id: Optional[int] = None) -> str:
     prompt = (
         f"Deskripsikan gambar berikut ('{filename}') secara detail dan jelas dalam Bahasa Indonesia. "
         "Sebutkan objek utama, konteks, teks yang terlihat (jika ada), dan hal penting lainnya."
     )
-    return call_ollama_vision(content, prompt)
+    return call_ollama_vision(content, prompt, telegram_id=telegram_id)
 
 
 # =========================================================================
@@ -713,7 +656,7 @@ def extract_video_frames(video_path: str, out_dir: str, num_frames: int) -> List
     return frame_paths
 
 
-def analyze_video(filename: str, content: bytes) -> str:
+def analyze_video(filename: str, content: bytes, telegram_id: Optional[int] = None) -> str:
     if not ffmpeg_available():
         return (
             f"[Tidak dapat menganalisis video '{filename}': ffmpeg/ffprobe tidak ditemukan di server. "
@@ -740,7 +683,7 @@ def analyze_video(filename: str, content: bytes) -> str:
                     f"dari video '{filename}'. Deskripsikan secara singkat apa yang terlihat di frame ini "
                     "dalam Bahasa Indonesia."
                 )
-                desc = call_ollama_vision(frame_bytes, prompt)
+                desc = call_ollama_vision(frame_bytes, prompt, telegram_id=telegram_id)
                 descriptions.append(f"Frame {i + 1}: {desc}")
             except AIEngineError as e:
                 descriptions.append(f"Frame {i + 1}: [Gagal dianalisis: {e.user_message}]")
@@ -758,7 +701,7 @@ def analyze_video(filename: str, content: bytes) -> str:
 # ZIP: EKSTRAKSI ISI DAN PEMROSESAN TIAP FILE SESUAI JENISNYA
 # =========================================================================
 
-def analyze_zip(filename: str, content: bytes) -> str:
+def analyze_zip(filename: str, content: bytes, telegram_id: Optional[int] = None) -> str:
     """
     Mengekstrak isi ZIP dan memproses tiap file di dalamnya sesuai jenisnya:
     - Teks/code/pdf/docx -> ekstraksi teks
@@ -808,7 +751,7 @@ def analyze_zip(filename: str, content: bytes) -> str:
 
         if ext in IMAGE_EXTENSIONS:
             try:
-                desc = analyze_image(entry_name, entry_bytes)
+                desc = analyze_image(entry_name, entry_bytes, telegram_id=telegram_id)
                 sections.append(f"\n--- {entry_name} (gambar) ---\n{desc}")
             except AIEngineError as e:
                 sections.append(f"\n--- {entry_name} (gambar) ---\n[Gagal dianalisis: {e.user_message}]")
@@ -816,7 +759,7 @@ def analyze_zip(filename: str, content: bytes) -> str:
 
         if ext in VIDEO_EXTENSIONS:
             try:
-                desc = analyze_video(entry_name, entry_bytes)
+                desc = analyze_video(entry_name, entry_bytes, telegram_id=telegram_id)
                 sections.append(f"\n--- {entry_name} (video) ---\n{desc}")
             except AIEngineError as e:
                 sections.append(f"\n--- {entry_name} (video) ---\n[Gagal dianalisis: {e.user_message}]")
@@ -828,7 +771,7 @@ def analyze_zip(filename: str, content: bytes) -> str:
     return note + "\n".join(sections)
 
 
-def process_uploaded_file(filename: str, content: bytes) -> Dict[str, object]:
+def process_uploaded_file(filename: str, content: bytes, telegram_id: Optional[int] = None) -> Dict[str, object]:
     """
     Entry point tunggal untuk memproses file apa pun yang diupload lewat Telegram.
     Mengembalikan dict berisi file_kind dan extracted_text (siap digabung ke prompt).
@@ -836,11 +779,11 @@ def process_uploaded_file(filename: str, content: bytes) -> Dict[str, object]:
     file_kind = detect_file_kind(filename)
 
     if file_kind == "image":
-        extracted = analyze_image(filename, content)
+        extracted = analyze_image(filename, content, telegram_id=telegram_id)
     elif file_kind == "video":
-        extracted = analyze_video(filename, content)
+        extracted = analyze_video(filename, content, telegram_id=telegram_id)
     elif file_kind == "zip":
-        extracted = analyze_zip(filename, content)
+        extracted = analyze_zip(filename, content, telegram_id=telegram_id)
     else:
         extracted = extract_text_from_file(filename, content)
 
@@ -878,7 +821,7 @@ def build_prompt_context(history: List[dict], new_message: str, role: Optional[s
     return messages
 
 
-def call_ollama_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
+def call_ollama_chat(messages: List[dict], model_name: str, telegram_id: Optional[int] = None) -> Dict[str, Any]:
     """
     Mengirim request ke Ollama /api/chat dan mengembalikan dict:
       {
@@ -886,18 +829,25 @@ def call_ollama_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
         "prompt_tokens": int,      # dari field 'prompt_eval_count' Ollama
         "completion_tokens": int,  # dari field 'eval_count' Ollama
         "total_tokens": int,       # prompt_tokens + completion_tokens
+        "model_used": str,         # model yang BENAR-BENAR dipakai (bisa beda dari
+                                    # model_name jika terjadi Smart Fallback di cluster)
+        "fallback_occurred": bool, # True jika node_manager melakukan auto-downgrade model
+        "fallback_log": List[str], # penjelasan tiap langkah fallback, untuk info ke user
       }
     Timeout diset 600 detik (10 menit) dan context window diset num_ctx=2048
     secara default agar prompt processing tidak lambat.
     """
     if CLUSTER_MODE == "master":
-        return _call_cluster_chat(messages, model_name)
-    return _call_local_ollama_chat(messages, model_name)
+        return _call_cluster_chat(messages, model_name, telegram_id=telegram_id)
+    result = _call_local_ollama_chat(messages, model_name)
+    result.setdefault("model_used", model_name)
+    result.setdefault("fallback_occurred", False)
+    result.setdefault("fallback_log", [])
+    return result
 
 
 def _call_local_ollama_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
     """Mode 'standalone': panggil Ollama lokal langsung (perilaku versi single-server)."""
-    ensure_model_ready(model_name)
     url = f"{OLLAMA_HOST}/api/chat"
     payload = {
         "model": model_name,
@@ -948,13 +898,17 @@ def _call_local_ollama_chat(messages: List[dict], model_name: str) -> Dict[str, 
         raise AIEngineError(str(e), f"Error tak terduga saat memanggil model AI: {e}")
 
 
-def _call_cluster_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
+def _call_cluster_chat(messages: List[dict], model_name: str, telegram_id: Optional[int] = None) -> Dict[str, Any]:
     """
-    Mode 'master': route request ke Worker Node paling sedikit beban lewat
-    node_manager.py, dengan failover otomatis. Import dilakukan di sini (bukan
-    di top-level module) supaya ai_engine.py tetap bisa dipakai di Worker Node
-    (yang tidak punya/tidak butuh node_manager.py maupun tabel worker_nodes)
-    tanpa ImportError.
+    Mode 'master': route request ke Worker Node terbaik lewat SMART WORKER
+    SELECTION (node_manager.py) -- kombinasi ketersediaan model, sisa VRAM,
+    load CPU/RAM, dan slot antrian -- dengan MODEL FALLBACK CHAIN otomatis
+    (mis. 70B -> 32B -> 14B -> 8B) jika model yang diminta tidak tersedia di
+    node manapun, dan failover antar-node jika node yang dipilih gagal
+    di tengah jalan. Import dilakukan di sini (bukan di top-level module)
+    supaya ai_engine.py tetap bisa dipakai di Worker Node (yang tidak
+    punya/tidak butuh node_manager.py maupun tabel worker_nodes) tanpa
+    ImportError.
 
     Jika SEMUA Worker Node gagal DAN MASTER_OLLAMA_FALLBACK aktif, dicoba
     sekali lagi lewat Ollama lokal di Master Node sendiri (lihat env var
@@ -964,14 +918,24 @@ def _call_cluster_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
     import node_manager
 
     try:
-        return node_manager.generate(model_name=model_name, messages=messages, options={"num_ctx": DEFAULT_NUM_CTX})
+        return node_manager.generate(
+            model_name=model_name,
+            messages=messages,
+            options={"num_ctx": DEFAULT_NUM_CTX},
+            telegram_id=telegram_id,
+            allow_fallback=True,
+        )
     except node_manager.NoAvailableWorkerError as e:
         if MASTER_OLLAMA_FALLBACK:
             logger.warning(
                 "Cluster: semua Worker Node gagal (%s) -- mencoba fallback ke Ollama lokal di Master Node.", e
             )
             try:
-                return _call_local_ollama_chat(messages, model_name)
+                result = _call_local_ollama_chat(messages, model_name)
+                result.setdefault("model_used", model_name)
+                result.setdefault("fallback_occurred", False)
+                result.setdefault("fallback_log", ["Fallback ke Ollama lokal di Master Node (semua Worker offline)."])
+                return result
             except AIEngineError:
                 # Ollama lokal di Master juga gagal (mis. model belum di-pull) --
                 # lempar error yang menyebut KEDUA jalur sudah dicoba, lebih
@@ -984,17 +948,25 @@ def _call_cluster_chat(messages: List[dict], model_name: str) -> Dict[str, Any]:
         logger.error("Cluster: tidak ada worker node tersedia: %s", e)
         raise AIEngineError(
             str(e),
-            "⚠️ Semua Worker Node AI sedang offline/sibuk. Coba lagi dalam beberapa saat, "
-            "atau hubungi owner bot untuk cek status cluster di Admin Dashboard.",
+            "⚠️ Semua Worker Node AI sedang offline/sibuk, atau tidak ada model yang cocok "
+            "tersedia saat ini. Coba lagi dalam beberapa saat, atau hubungi owner bot untuk "
+            "cek status cluster di Admin Dashboard.",
         )
 
 
-def chat(user_message: str, history: List[dict], model_name: str, role: Optional[str] = None) -> Dict[str, Any]:
+def chat(
+    user_message: str,
+    history: List[dict],
+    model_name: str,
+    role: Optional[str] = None,
+    telegram_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     High-level helper: cek pola jailbreak lokal dulu (murah, tanpa memanggil Ollama).
     Jika terdeteksi, langsung kembalikan pesan penolakan tanpa membebani model/kuota
     user. Jika aman, bangun konteks (system prompt sesuai role + riwayat + pesan baru)
-    dan panggil Ollama dengan model tier yang dipilih user.
+    dan panggil Ollama dengan model tier yang dipilih user (dengan Smart Fallback
+    otomatis di mode cluster jika model tsb tidak tersedia).
     """
     if detect_jailbreak_attempt(user_message):
         logger.info("Jailbreak pattern terdeteksi pada pesan user, request tidak diteruskan ke Ollama.")
@@ -1003,7 +975,10 @@ def chat(user_message: str, history: List[dict], model_name: str, role: Optional
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            "model_used": model_name,
+            "fallback_occurred": False,
+            "fallback_log": [],
         }
 
     messages = build_prompt_context(history, user_message, role)
-    return call_ollama_chat(messages, model_name)
+    return call_ollama_chat(messages, model_name, telegram_id=telegram_id)

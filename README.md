@@ -1,89 +1,114 @@
-# Private AI Telegram Bot
+# Enterprise Private AI Telegram Bot
 
-Bot Telegram AI privat (mode polling): obrolan umum & coding lewat sistem Role +
-Tier model (🗣️ General Chat: llama3.2:3b/llama3.1:8b, 💻 Coder/IT: qwen2.5-coder
-1.5b/7b/14b) + analisis gambar & video (qwen2.5vl). Setiap user mendapat kuota
-token harian, dengan sistem kode redeem untuk menaikkan kuota (termasuk unlimited)
-hingga masa berlaku tertentu. Dilengkapi proteksi anti-jailbreak bawaan untuk
-menjaga model tetap pada persona & aturannya.
+Bot Telegram AI privat (mode polling) berbasis Ollama dengan arsitektur
+terdistribusi **Master-Worker Cluster**: obrolan umum & coding lewat sistem
+Role + Tier model (🗣️ General Chat, 💻 Coder/IT, 🧩 Extended — 20+ model dari
+CPU-only ringan sampai model raksasa wajib GPU) + analisis gambar & video
+(qwen2.5vl). Dilengkapi **Smart Hardware Management** (deteksi GPU/VRAM
+otomatis), **Smart Worker Selection**, **Model Fallback otomatis**, dan
+**Zero-OOM Queue Protection** — dirancang agar sistem bisa berjalan tanpa
+intervensi manual owner setelah instalasi selesai.
+
+## Fitur Utama (Enterprise v2)
+
+- **Smart GPU Detection** — tiap Worker Node mendeteksi GPU (vendor, nama,
+  CUDA, VRAM total/free/used) via `nvidia-smi` saat startup, fallback ke
+  `torch.cuda` jika tersedia. Hasil di-cache dan direfresh berkala.
+- **Dynamic Model Availability** — model otomatis berstatus *Ready* atau
+  *Locked* berdasarkan VRAM bebas saat itu (CPU-Only → maks 8B, GPU 8GB →
+  hingga 14B, GPU 24GB → hingga 32B, dst).
+- **Auto Model Pull & Cache** — model baru bisa ditarik langsung dari
+  Telegram (`/pullmodel`) atau Admin Dashboard, dengan progress log real-time,
+  cache model lokal otomatis di-refresh setelahnya.
+- **Auto Unload & Safe Mode** — model yang idle >20 menit (dapat diatur)
+  otomatis dilepas dari VRAM. Jika RAM/VRAM node nyaris habis, node masuk
+  *Safe Mode* dan mengunci model besar sampai kondisi membaik.
+- **Smart Worker Selection** — Master Node memilih Worker Node bukan cuma
+  dari antrean, tapi dari kombinasi: ketersediaan model, sisa VRAM, load
+  CPU, dan load RAM.
+- **Model Fallback Otomatis & Transparan** — jika model yang diminta user
+  penuh/locked di semua node, bot **otomatis** fallback ke model lebih kecil
+  (mis. 70B → 32B → 14B → 8B) dan memberi tahu user model apa yang
+  benar-benar dipakai — tidak pernah diam-diam mengganti tanpa penjelasan.
+- **Smart Queue System** — antrean dibatasi per ukuran model (mis. 70B maks
+  1 request, 32B maks 2, 14B maks 4, 8B tanpa batas) untuk mencegah
+  Kernel Panic/OOM di Worker Node.
+- **Web Dashboard bergaya Mission Control** — status cluster publik
+  real-time (GPU, VRAM, CPU, RAM, task aktif, model ready/locked) + Admin
+  Panel untuk CRUD Worker Node, pull/unload model, dan monitoring antrean.
 
 ## Isi Paket
 
-**Single-Server / Master Node:**
-- `bot.py`            — Bot Telegram utama (polling, python-telegram-bot)
-- `ai_engine.py`      — Logika inti: ekstraksi file, panggilan ke Ollama (chat & vision)
-- `database.py`       — Layer SQLite: riwayat chat, data user, limit, kode redeem, registry cluster
-- `github_backup.py`  — Backup & restore database ke GitHub lewat REST API (lihat bagian di bawah)
-- `master_dashboard.py` — Web Dashboard (FastAPI): status publik cluster + Admin Panel CRUD Worker Node
-- `node_manager.py`   — Load Balancer & health-check Worker Node (hanya aktif di Master Node)
+**Master Node:**
+- `bot.py` — Bot Telegram utama (polling, python-telegram-bot), termasuk
+  command admin cluster (`/hardware`, `/worker`, `/queue`, `/pullmodel`,
+  `/unload`, `/modelsync`)
+- `ai_engine.py` — Logika inti: ekstraksi file, panggilan ke Ollama (chat &
+  vision), Model Fallback Chain
+- `database.py` — Layer SQLite: riwayat chat, user, kode redeem, registry
+  cluster (hardware GPU/VRAM), log antrean
+- `github_backup.py` — Backup & restore database ke GitHub lewat REST API
+- `node_manager.py` — Smart Load Balancer: health-check, Smart Worker
+  Selection, Model Fallback Chain (**hanya aktif di Master Node**)
+- `web_app.py` — Web Dashboard API murni (FastAPI), menyajikan file statis
+  dari folder `web/`
 
-**Worker Node** (Distributed Cluster Architecture, opsional):
-- `worker_agent.py`   — Agent FastAPI ringan yang menjembatani Master ↔ Ollama lokal di tiap Worker
+**Web Dashboard (folder `web/`, HTML/CSS/JS murni, tanpa build step):**
+- `index.html`, `style.css`, `dashboard.js` — Dashboard publik (status
+  cluster real-time, bertema *mission control*)
+- `admin.html`, `admin.js` — Admin Panel (CRUD node, pull/unload model,
+  monitoring antrean & user)
+
+**Worker Node** (Distributed Cluster Architecture):
+- `worker_agent.py` — Agent FastAPI Enterprise: Smart GPU Detection, Auto
+  Pull/Unload, Safe Mode, Smart Queue Limiter
 
 **Deployment:**
-- `install.sh`        — Installer utama (menu interaktif: Single-Server / Update / Master / Worker)
-- `update.sh`         — Smart Updater mandiri (git pull tanpa menimpa `.env`/database/SSL)
-- `motd_setup.sh`      — Pasang SSH Welcome Banner (status Bot/Ollama/CPU/RAM saat login)
-- `ollama-limit.conf` — Referensi systemd drop-in (cgroups, batas 70% CPU/RAM untuk Ollama)
+- `install.sh` — Installer utama (menu interaktif: Single-Server / Update /
+  Master / Worker)
+- `update.sh` — Smart Updater mandiri (git pull tanpa menimpa
+  `.env`/database/SSL)
+- `motd_setup.sh` — Pasang SSH Welcome Banner (status Bot/Ollama/CPU/RAM
+  saat login)
+- `ollama-limit.conf` — Referensi systemd drop-in (cgroups, batas 70%
+  CPU/RAM untuk Ollama)
 
 ## Cara Deploy
-1. Upload semua file di atas ke repo GitHub Anda (ini repo *source code*, terpisah
-   dari repo backup database di bagian "Backup Database ke GitHub" di bawah).
-2. Edit `install.sh` **dan** `update.sh`, ganti `REPO_GIT_URL` di bagian atas
-   masing-masing file dengan URL repo Anda (harus sama persis di keduanya).
+
+1. Upload semua file di atas (termasuk folder `web/` apa adanya) ke repo
+   GitHub Anda.
+2. Edit `install.sh` **dan** `update.sh`, ganti `REPO_GIT_URL` di bagian
+   atas masing-masing file dengan URL repo Anda (harus sama persis).
 3. Siapkan dua hal dari Telegram sebelum instalasi:
-   - **Token Bot** dari [@BotFather](https://t.me/BotFather) (perintah `/newbot`)
-   - **ID Telegram Owner** dari [@userinfobot](https://t.me/userinfobot) (kirim pesan apa
-     saja, ID kamu akan ditampilkan)
+   - **Token Bot** dari [@BotFather](https://t.me/BotFather) (`/newbot`)
+   - **ID Telegram Owner** dari [@userinfobot](https://t.me/userinfobot)
 4. Di VPS Ubuntu, jalankan:
    ```
-   curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/install.sh | sudo bash
+   curl -sL https://raw.githubusercontent.com/<repo-anda>/main/install.sh | sudo bash
    ```
-5. Installer menampilkan menu interaktif — pilih **[1] Install Baru (Single-Server)**
-   untuk 1 VPS yang menjalankan Ollama & Bot sekaligus (paling sederhana), atau **[3]/[4]**
-   jika ingin arsitektur cluster Master/Worker (lihat bagian "Arsitektur Cluster" di bawah).
-6. Installer akan meminta Token Bot dan ID Owner di tengah proses instalasi, lalu
-   otomatis menyimpannya ke `/opt/ai-bot/.env` (chmod 600) — TIDAK ADA di source code.
-7. (Opsional) Pasang SSH Welcome Banner agar status Bot/Ollama/CPU/RAM tampil
-   otomatis saat login SSH ke server:
-   ```
-   sudo bash motd_setup.sh
-   ```
-8. Setelah instalasi selesai, buka Telegram dan kirim `/start` ke bot Anda — daftar
-   perintah juga otomatis muncul di menu "/" Telegram (kiri bawah kotak chat).
+5. Installer menampilkan menu interaktif — pilih **[1] Install Baru
+   (Single-Server)** untuk 1 VPS sederhana, atau **[3]/[4]** untuk arsitektur
+   cluster Master/Worker (lihat "Arsitektur Cluster" di bawah — sangat
+   direkomendasikan jika Anda punya VPS dengan GPU terpisah).
+6. Installer meminta Token Bot dan ID Owner, lalu otomatis menyimpannya ke
+   `/opt/ai-bot/.env` (chmod 600) — TIDAK ADA di source code.
+7. (Opsional) Pasang SSH Welcome Banner: `sudo bash motd_setup.sh`
+8. Setelah instalasi selesai, kirim `/start` ke bot Anda di Telegram.
 
-Bot berjalan mode **polling**, jadi tidak butuh domain, SSL/certbot, maupun Nginx —
-cukup koneksi internet keluar dari VPS ke server Telegram.
+Bot berjalan mode **polling** — tidak butuh domain, SSL/certbot, maupun
+Nginx.
 
 ## Kuota Token & Kode Redeem
 
-- Setiap user baru otomatis mendapat **50.000 token/hari** (reset otomatis tiap
-  ganti hari UTC). Token terpakai dihitung dari jumlah token asli Ollama
-  (prompt + hasil jawaban) dikali multiplier tier model yang dipakai.
-- User memilih **Role** lalu **Tier** model AI lewat `/model` (2 langkah, Inline
-  Keyboard Telegram):
-  - 🗣️ **General Chat** — untuk obrolan santai, tanya umum, curhat, dll:
-    - 🟢 Light (`llama3.2:3b`) — kuota token x1, paling irit
-    - 🟡 Medium (`llama3.1:8b`) — kuota token x2, **default user baru**
-  - 💻 **Coder / IT** — untuk ngoding, debugging, pertanyaan teknis:
-    - 🟢 Light (`qwen2.5-coder:1.5b`) — kuota token x1, paling irit
-    - 🟡 Medium (`qwen2.5-coder:7b`) — kuota token x2
-    - 🔴 Heavy (`qwen2.5-coder:14b`) — kuota token x3, reasoning maksimal
-  - User bisa ganti role/tier kapan saja lewat `/model`, tanpa kehilangan riwayat
-    chat maupun kuota token yang tersisa.
-- Owner bisa membuat kode redeem lewat command di Telegram:
-  ```
-  /gencode <jumlah_token> <hari>   contoh: /gencode 100000 30
-  /gencode unlimited <hari>        contoh: /gencode unlimited 365
-  ```
-- User menukar kode dengan:
-  ```
-  /redeem <kode>
-  ```
-- Setiap kode hanya bisa dipakai **satu kali** oleh satu user.
-- Setelah masa berlaku (hari) habis, kuota user otomatis kembali ke default
-  50.000 token/hari — ini dicek otomatis setiap kali user mengirim pesan,
-  tidak perlu campur tangan owner.
+- Setiap user baru otomatis mendapat **50.000 token/hari** (reset otomatis
+  tiap ganti hari UTC). Token terpakai = token asli Ollama × multiplier
+  tier model.
+- User memilih **Role** lalu **Tier** lewat `/model` (Inline Keyboard,
+  2 langkah): 🗣️ General Chat, 💻 Coder/IT, atau 🧩 Extended (katalog 20+
+  model termasuk kelas ultra-heavy yang wajib GPU besar).
+- Owner membuat kode redeem: `/gencode <jumlah_token|unlimited> <hari>`.
+  User menukar dengan `/redeem <kode>`. Setiap kode hanya bisa dipakai
+  sekali; setelah masa berlaku habis, kuota kembali ke default otomatis.
 
 ## Perintah Bot
 
@@ -91,173 +116,123 @@ cukup koneksi internet keluar dari VPS ke server Telegram.
 | Command | Fungsi |
 |---|---|
 | `/start`, `/help` | Info & daftar perintah |
-| `/status` | Lihat sisa kuota token hari ini & role+tier model aktif |
-| `/model` | Pilih Role (General Chat/Coder-IT) lalu Tier model AI |
-| `/redeem <kode>` | Tukar kode redeem untuk menaikkan kuota token |
-| `/reset` | Hapus riwayat chat (mulai percakapan baru) |
+| `/status` | Sisa kuota token & model aktif hari ini |
+| `/model` | Pilih Role lalu Tier model AI |
+| `/redeem <kode>` | Tukar kode redeem |
+| `/reset` | Hapus riwayat chat |
 
-**Khusus Owner** (berdasarkan `OWNER_TELEGRAM_ID`):
+**Khusus Owner — Umum:**
 | Command | Fungsi |
 |---|---|
-| `/gencode <jumlah_token\|unlimited> <hari>` | Buat kode redeem baru |
-| `/codes` | Lihat kode redeem yang belum dipakai |
-| `/users` | Lihat daftar user & status kuota mereka |
-| `/ban <id>` | Nonaktifkan akses user |
-| `/unban <id>` | Aktifkan kembali akses user |
-| `/broadcast <pesan>` | Kirim pesan ke semua user terdaftar |
+| `/gencode <token\|unlimited> <hari>` | Buat kode redeem baru |
+| `/codes` | Kode redeem yang belum dipakai |
+| `/users` | Daftar user & status kuota |
+| `/ban` / `/unban <id>` | Nonaktifkan/aktifkan akses user |
+| `/broadcast <pesan>` | Kirim pesan ke semua user |
 
-Semua perintah di atas otomatis terdaftar ke menu **"/"** Telegram (kiri bawah kotak
-chat) saat bot startup — user cukup ketik `/` untuk melihat daftar lengkap tanpa
-perlu mengetik manual. Menu owner (termasuk command admin) hanya muncul khusus di
-chat pribadi `OWNER_TELEGRAM_ID` dengan bot, tidak terlihat oleh user lain.
-
-**Feedback visual saat AI berpikir:** untuk chat maupun upload file, bot mengirim
-satu pesan status yang diperbarui secara berkala ("🧠 Membaca konteks..." → "🔎
-Menyusun jawaban..." → dst. mengikuti durasi proses), lalu otomatis terhapus begitu
-jawaban asli terkirim — memberi kepastian visual bahwa bot masih bekerja, terutama
-untuk model besar/berkas panjang yang bisa memakan waktu beberapa menit.
+**Khusus Owner — Cluster & Hardware (hanya aktif jika `CLUSTER_MODE=master`):**
+| Command | Fungsi |
+|---|---|
+| `/hardware` | Spek GPU/VRAM/CPU/RAM semua Worker Node |
+| `/worker` | Ringkasan status cluster (online/offline, model ready/locked, safe mode) |
+| `/queue` | Antrean aktif per node + histori event (queued/started/completed/failed/fallback) |
+| `/pullmodel <model> [node_id]` | Pull model ke satu/semua Worker Node |
+| `/unload <model> <node_id>` | Unload model dari VRAM node tertentu |
+| `/modelsync [node_id]` | Paksa refresh cache model dari Worker Node |
 
 ## Fitur Upload
 
-Kirim file langsung ke bot (sebagai dokumen, foto, atau video Telegram):
+| Jenis file | Ekstensi | Diproses dengan |
+|---|---|---|
+| Dokumen/code | .txt .md .csv .json .py .js .html .css dst | Ekstraksi teks langsung |
+| PDF | .pdf | pypdf |
+| Word | .docx | python-docx |
+| Gambar | .jpg .jpeg .png .webp .bmp .gif | qwen2.5vl (vision) |
+| Video | .mp4 .mov .mkv .avi .webm .m4v | ffmpeg (4 frame) + qwen2.5vl |
+| ZIP | .zip | Diekstrak, tiap file diproses sesuai jenisnya (maks 20 file, 200MB) |
 
-| Jenis file      | Ekstensi                                   | Diproses dengan          |
-|-----------------|---------------------------------------------|---------------------------|
-| Dokumen/code    | .txt .md .csv .json .py .js .html .css dst | Ekstraksi teks langsung   |
-| PDF             | .pdf                                        | pypdf                     |
-| Word            | .docx                                       | python-docx               |
-| Gambar          | .jpg .jpeg .png .webp .bmp .gif            | qwen2.5vl (vision)        |
-| Video           | .mp4 .mov .mkv .avi .webm .m4v             | ffmpeg (sampling 4 frame) + qwen2.5vl |
-| ZIP             | .zip                                        | Diekstrak, tiap file di dalam diproses otomatis sesuai jenisnya (maks 20 file, maks 200MB hasil ekstrak) |
-
-Batas upload per file: **50 MB**. Setiap file yang diproses tetap dihitung sebagai
-pemakaian kuota token harian (sesuai jumlah token hasil pemrosesan x multiplier tier model).
+Batas upload: **50 MB**. Vision TIDAK memakai Model Fallback Chain (fallback
+ke model non-vision tidak relevan secara semantik).
 
 ## Proteksi Anti-Jailbreak
 
-Model kecil (1.5b–8b) yang dipakai di tier Light/Medium relatif lebih mudah
-"dibujuk" keluar dari aturan/persona-nya dibanding model besar. Bot ini punya
-2 lapis proteksi:
+1. **Pengecekan pola lokal** — pola jailbreak umum terdeteksi sebelum
+   request dikirim ke Ollama, bot langsung menolak tanpa memotong kuota.
+2. **System prompt yang diperkuat** — instruksi keamanan tetap yang tidak
+   bisa dioverride lewat env var maupun pesan user manapun.
 
-1. **Pengecekan pola lokal** (di kode Python, sebelum request dikirim ke Ollama) —
-   mendeteksi pola umum jailbreak (misal "ignore all previous instructions",
-   "abaikan instruksi sebelumnya", "developer mode activated", dll). Jika
-   terdeteksi, bot langsung membalas penolakan tanpa memanggil model sama
-   sekali — **tidak memotong kuota token user**.
-2. **System prompt yang diperkuat** — setiap request ke Ollama selalu menyertakan
-   instruksi keamanan tetap yang tidak bisa dioverride lewat env var maupun
-   pesan dari user manapun (termasuk yang mengaku developer/owner/admin).
+## Arsitektur Cluster (Master-Worker)
 
-Kedua lapis ini berlaku untuk **kedua role** (General Chat maupun Coder/IT).
-
-## Migrasi dari Versi Sebelumnya (3-Tier Coder-Only)
-
-Kalau kamu sudah punya bot ini berjalan dari versi sebelum sistem Role (yang
-cuma punya tier Light/Medium/Heavy berbasis qwen2.5-coder saja), migrasi
-database berjalan **otomatis dan aman**:
-
-- Kolom baru `model_role` ditambahkan lewat `ALTER TABLE`, database & riwayat
-  chat lama **tidak dihapus**.
-- User yang sudah ada di-backfill ke `model_role = 'coder'` secara otomatis,
-  sehingga **model yang mereka pakai tetap sama persis** seperti sebelum update
-  (tidak ada yang tiba-tiba pindah ke model General tanpa sepengetahuan mereka).
-- Hanya user **baru** (belum pernah chat sebelumnya) yang mendapat default baru
-  (General Chat, tier Medium → `llama3.1:8b`).
-- Cukup jalankan ulang `install.sh` (mode Update) di server yang sudah ada,
-  migrasi kolom akan otomatis dijalankan sebelum service di-restart.
-
-## Arsitektur Cluster (Master-Worker, Opsional)
-
-Selain mode **Single-Server** (1 VPS menjalankan semuanya, cara paling sederhana),
-bot ini juga mendukung **Distributed Cluster Architecture** untuk menyebar beban
-inferensi AI ke beberapa VPS sekaligus:
-
-- **Master Node** — menjalankan Telegram Bot, Load Balancer (`node_manager.py`),
-  Web Dashboard (`master_dashboard.py`), dan database SQLite. Secara default
-  **tidak** menjalankan Ollama sendiri.
-- **Worker Node** — VPS terpisah yang HANYA menjalankan Ollama + `worker_agent.py`
-  (agent ringan di port `3716`). Bisa didaftarkan sebanyak apa pun ke Master lewat
-  Admin Dashboard, tanpa perlu restart Bot Telegram.
-- **Load Balancing "Least Loaded"** — tiap request AI dirutekan ke Worker Node
-  dengan `active_tasks` paling sedikit (tie-break: CPU lalu RAM lebih rendah),
-  dengan failover otomatis ke Worker Node berikutnya jika node yang dipilih gagal.
-- **Ollama Fallback di Master Node (opsional)** — saat memilih **[3] Install
-  Master Node** di `install.sh`, ada opsi tambahan untuk JUGA menjalankan Ollama
-  lokal di Master sebagai cadangan terakhir, dipakai HANYA jika **semua** Worker
-  Node di cluster sedang offline/tidak tersedia. Nonaktif secara default. Jika
-  diaktifkan, Ollama otomatis dibatasi maksimal **70% CPU & 70% RAM** (lihat
-  `ollama-limit.conf`) supaya Bot & Dashboard di server yang sama tetap stabil.
+- **Master Node** — Telegram Bot, Smart Load Balancer (`node_manager.py`),
+  Web Dashboard (`web_app.py`), database SQLite. Secara default **tidak**
+  menjalankan Ollama sendiri (opsional: Ollama Fallback, lihat di bawah).
+- **Worker Node** — VPS terpisah menjalankan Ollama + `worker_agent.py`
+  Enterprise (Smart GPU Detection, Auto Pull/Unload, Safe Mode) di port
+  `3716`. Didaftarkan ke Master lewat Admin Dashboard, online otomatis
+  dalam ~7 detik tanpa restart Bot.
+- **Smart Worker Selection** — request dirutekan ke node dengan skor
+  terbaik: model *ready* (bukan locked), slot antrean belum penuh, lalu
+  diurutkan dari active_tasks terendah → CPU terendah → RAM terendah →
+  VRAM bebas terbanyak.
+- **Model Fallback Chain** — jika model yang diminta locked/penuh di
+  seluruh cluster, sistem mencari model sefamili yang lebih kecil dulu
+  (mis. `qwen2.5-coder:32b` → `qwen2.5-coder:14b`), lalu fallback
+  lintas-keluarga jika perlu. User selalu diberi tahu jika terjadi
+  fallback.
+- **Failover antar-node** — jika node yang dipilih gagal/timeout di
+  tengah proses, request otomatis dicoba ke node kandidat berikutnya.
+- **Ollama Fallback di Master Node (opsional)** — saat instal Master Node,
+  ada opsi menjalankan Ollama lokal di Master sebagai cadangan terakhir,
+  dipakai HANYA jika semua Worker Node offline. Nonaktif secara default,
+  otomatis dibatasi 70% CPU/RAM jika diaktifkan.
 
 **Cara deploy cluster:**
-1. Jalankan `install.sh` di VPS pertama, pilih **[3] Install MASTER NODE**.
-2. Jalankan `install.sh` di tiap VPS Worker, pilih **[4] Install WORKER NODE**
-   — installer akan menampilkan API Key unik untuk node tsb.
-3. Buka `http://<ip-master>:8080/admin` (kredensial sesuai yang diisi saat
-   instalasi Master), tambahkan tiap Worker Node (nama, IP, port, API Key).
-4. Status cluster publik bisa dilihat di `http://<ip-master>:8080/` (tanpa login,
-   IP Worker Node disamarkan demi keamanan).
+1. `install.sh` di VPS pertama → **[3] Install MASTER NODE**.
+2. `install.sh` di tiap VPS Worker (idealnya dengan GPU) → **[4] Install
+   WORKER NODE** — installer menampilkan API Key unik & ringkasan status
+   GPU/CPU-only node tsb.
+3. Buka `http://<ip-master>:8080/admin` → tambahkan tiap Worker Node.
+4. Status cluster publik: `http://<ip-master>:8080/` (tanpa login, IP
+   Worker disamarkan).
+
+## Web Dashboard
+
+- **Publik** (`/`) — status real-time semua node: LED status
+  (online/offline/error), bar VRAM/CPU/RAM bergaya hardware, jumlah model
+  ready/locked, task aktif, latency. Refresh otomatis tiap 5 detik.
+- **Admin** (`/admin`, HTTP Basic Auth) — tambah/hapus/toggle Worker Node,
+  trigger pull/unload model langsung dari browser, monitoring antrean +
+  histori event, daftar user bot.
+- Dibangun murni HTML/CSS/JS (Tailwind-free, tanpa build step) agar mudah
+  di-audit dan di-modifikasi.
 
 ## Update & Maintenance Server
 
-**Update source code** (aman, tidak menyentuh `.env`/database/sertifikat SSL):
 ```
-curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/update.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/<repo-anda>/main/update.sh | sudo bash
 ```
-Script ini otomatis mendeteksi instalasi yang ada (Single-Server/Master di
-`/opt/ai-bot`, Worker di `/opt/ai-worker`), menjalankan `git pull`, migrasi
-database (idempotent), lalu merestart service yang relevan — tanpa perlu mengisi
-ulang Token Bot, ID Owner, atau konfigurasi lain yang sudah ada.
-
-**SSH Welcome Banner** — menampilkan status Bot/Dashboard/Worker Agent/Ollama
-serta CPU/RAM/Disk setiap kali login SSH ke server:
-```
-sudo bash motd_setup.sh
-```
-Dipasang ke `/etc/profile.d/` (berlaku untuk semua user, bukan hanya satu akun).
-Lepas dengan `sudo rm /etc/profile.d/99-ai-bot-banner.sh`.
-
-**Batas resource Ollama** (`ollama-limit.conf`) — di mode Single-Server, batas
-70% CPU & 70% RAM untuk Ollama diterapkan **otomatis** oleh `install.sh` (dihitung
-sesuai jumlah core & RAM fisik server saat itu). Untuk mengecek batas yang aktif:
-```
-systemctl show ollama --property=CPUQuotaPerSecUSec,MemoryMax,MemoryHigh
-```
+Auto-detect instalasi (Single-Server/Master di `/opt/ai-bot`, Worker di
+`/opt/ai-worker`), git pull (termasuk folder `web/`), migrasi database
+(idempotent, termasuk kolom hardware/queue baru), pull model baru, restart
+service — **tanpa** menyentuh `.env`/database/SSL.
 
 ## Backup Database ke GitHub (Opsional)
 
-Database (`bot_data.db`) bisa di-backup otomatis ke repo GitHub terpisah, supaya
-riwayat chat & user tetap aman walau server hilang/di-reset.
-
-- Cara kerja: tiap 60 detik bot mengecek apakah database berubah, lalu meng-gzip
-  dan meng-upload-nya lewat **GitHub REST API** (`github_backup.py`) — **bukan**
-  lewat perintah `git`. Ini sengaja dipisah total dari repo source code bot,
-  supaya proses update kode (`git pull`) tidak akan pernah menyentuh atau
-  menghapus database.
-- Setup: saat instalasi (atau lewat menu Update), masukkan **GitHub PAT** (fine-grained,
-  di-scope ke satu repo backup, izin *Contents: Read and write*) dan **repo tujuan**
-  (`owner/repo`, harus repo terpisah dari repo source code bot ini).
-- Saat instalasi, kalau repo backup sudah punya database lama, otomatis di-restore
-  lebih dulu sebelum bot dijalankan.
-- Konfigurasi tersimpan di `.env`: `GH_BACKUP_ENABLED`, `GH_BACKUP_PAT`,
-  `GH_BACKUP_REPO`, `GH_BACKUP_BRANCH` (default `main`), `GH_BACKUP_PATH`
-  (default `bot_data.db.gz`).
-- Kosongkan PAT saat instalasi kalau tidak ingin memakai fitur ini — bot tetap
-  berjalan normal tanpa backup GitHub.
+Database di-backup otomatis tiap 60 detik (jika berubah) lewat GitHub REST
+API — bukan `git`, jadi update source code tidak akan pernah menyentuh
+database. Setup: masukkan GitHub PAT (fine-grained, *Contents: Read and
+write*) dan repo tujuan terpisah saat instalasi/update.
 
 ## Keamanan
-- Token Bot & ID Owner wajib via environment variable (`TELEGRAM_BOT_TOKEN`,
-  `OWNER_TELEGRAM_ID`) — bot menolak start jika tidak diset.
-- Rahasia disimpan di `/opt/ai-bot/.env` (chmod 600), dimuat oleh systemd `EnvironmentFile=`.
-- Bot jalan sebagai user sistem non-root (`aibot`) dengan systemd hardening
-  (`ProtectSystem=strict`, `NoNewPrivileges=true`, dll). Worker Node (`aiworker`)
-  memakai hardening yang sama di service `ai-worker-agent`.
-- Hanya `OWNER_TELEGRAM_ID` yang bisa memakai command admin (`/gencode`, `/users`,
-  `/ban`, `/broadcast`, dll) — command ini ditolak otomatis untuk user lain, dan
-  menu commandnya pun hanya terdaftar di chat pribadi owner (lihat "Perintah Bot").
-- Komunikasi Master ↔ Worker Node diautentikasi lewat header `X-API-KEY` unik
-  per node; Admin Dashboard (`/admin`) dilindungi HTTP Basic Auth (`ADMIN_USERNAME`/
-  `ADMIN_PASSWORD`), dan API Key Worker Node tidak pernah ditampilkan penuh di UI
-  (hanya 4 karakter terakhir).
+
+- Token Bot & ID Owner wajib via env var, bot menolak start jika tidak diset.
+- Rahasia di `.env` (chmod 600), dimuat lewat systemd `EnvironmentFile=`.
+- Bot & Worker Agent berjalan sebagai user sistem non-root dengan systemd
+  hardening (`ProtectSystem=strict`, `NoNewPrivileges=true`).
+- Hanya `OWNER_TELEGRAM_ID` bisa memakai command admin.
+- Master ↔ Worker Node diautentikasi via header `X-API-KEY` unik per node.
+- Admin Dashboard dilindungi HTTP Basic Auth; API Key Worker Node tidak
+  pernah ditampilkan penuh di UI (hanya 4 karakter terakhir).
 
 ## Mengganti Token Bot / ID Owner
 ```
@@ -268,10 +243,14 @@ sudo systemctl restart ai-bot
 ## Melihat Log
 ```
 sudo journalctl -u ai-bot -f
+sudo journalctl -u ai-bot-dashboard -f   # Master: Web Dashboard
+sudo journalctl -u ai-worker-agent -f    # Worker: Hardware/GPU/Safe Mode
 ```
 
 ## Restart Service
 ```
 sudo systemctl restart ai-bot
+sudo systemctl restart ai-bot-dashboard
+sudo systemctl restart ai-worker-agent
 sudo systemctl restart ollama
 ```
