@@ -84,7 +84,7 @@ intervensi manual owner setelah instalasi selesai.
    - **ID Telegram Owner** dari [@userinfobot](https://t.me/userinfobot)
 4. Di VPS Ubuntu, jalankan:
    ```
-   curl -sL https://raw.githubusercontent.com/<repo-anda>/main/install.sh | sudo bash
+   curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/install.sh | sudo bash
    ```
 5. Installer menampilkan menu interaktif — pilih **[1] Install Baru
    (Single-Server)** untuk 1 VPS sederhana, atau **[3]/[4]** untuk arsitektur
@@ -209,7 +209,7 @@ ke model non-vision tidak relevan secara semantik).
 ## Update & Maintenance Server
 
 ```
-curl -sL https://raw.githubusercontent.com/<repo-anda>/main/update.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/BimxyzDev/Private-AI-Telegram-Bot/main/update.sh | sudo bash
 ```
 Auto-detect instalasi (Single-Server/Master di `/opt/ai-bot`, Worker di
 `/opt/ai-worker`), git pull (termasuk folder `web/`), migrasi database
