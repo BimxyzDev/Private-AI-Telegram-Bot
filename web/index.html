@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AI Cluster — Status Node</title>
+<meta name="description" content="Status real-time cluster AI terdistribusi" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="scanline-overlay" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-dot" id="masterPulse"></span>
+        <span class="brand-text">AI CLUSTER<span class="brand-sub">// STATUS NODE</span></span>
+      </div>
+      <div class="topbar-clock" id="clock">--:--:--</div>
+    </div>
+  </header>
+
+  <main class="wrap">
+
+    <!-- Stat strip: ringkasan seluruh cluster -->
+    <section class="stat-strip" id="statStrip" aria-label="Ringkasan cluster">
+      <div class="stat-cell">
+        <div class="stat-label">NODE ONLINE</div>
+        <div class="stat-value" id="statOnline">–</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-label">GPU NODES</div>
+        <div class="stat-value" id="statGpu">–</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-label">VRAM BEBAS</div>
+        <div class="stat-value" id="statVram">–</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-label">TASK AKTIF</div>
+        <div class="stat-value" id="statTasks">–</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-label">MODEL SIAP</div>
+        <div class="stat-value" id="statModels">–</div>
+      </div>
+    </section>
+
+    <!-- Rack: daftar node -->
+    <section aria-label="Daftar Worker Node">
+      <div class="section-head">
+        <h1>WORKER NODES</h1>
+        <span class="section-note">refresh otomatis tiap 5 detik</span>
+      </div>
+      <div id="rack" class="rack">
+        <div class="empty-state">Memuat data cluster…</div>
+      </div>
+    </section>
+
+    <footer class="page-footer">
+      <span>Enterprise AI Bot Cluster · Dashboard v2.0</span>
+      <span id="lastUpdated">—</span>
+    </footer>
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

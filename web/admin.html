@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AI Cluster — Admin Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="scanline-overlay" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-dot" id="masterPulse"></span>
+        <span class="brand-text">AI CLUSTER<span class="brand-sub">// ADMIN PANEL</span></span>
+      </div>
+      <a href="/" style="color:var(--text-dim); font-family:var(--font-mono); font-size:12px; text-decoration:none;">← Lihat Dashboard Publik</a>
+    </div>
+  </header>
+
+  <main class="wrap">
+
+    <section class="stat-strip" id="statStrip" aria-label="Ringkasan cluster">
+      <div class="stat-cell">
+        <div class="stat-label">NODE ONLINE</div>
+        <div class="stat-value" id="statOnline">–</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-label">TASK AKTIF</div>
+        <div class="stat-value" id="statTasks">–</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-label">TOTAL USER</div>
+        <div class="stat-value" id="statUsers">–</div>
+      </div>
+    </section>
+
+    <div class="admin-grid">
+      <!-- KOLOM KIRI: Node registry + form tambah node -->
+      <div>
+        <div class="panel" style="margin-bottom:20px;">
+          <h2>Tambah Worker Node</h2>
+          <div class="form-grid">
+            <input id="f_name" placeholder="Nama (mis. worker-jkt-1)" />
+            <input id="f_host" placeholder="IP / domain" />
+            <input id="f_port" placeholder="Port" value="3716" />
+            <input id="f_priority" placeholder="Priority (default 100)" value="100" />
+            <input id="f_key" class="field-full" placeholder="API Key" />
+            <input id="f_tags" class="field-full" placeholder="Tags (opsional, mis. gpu,jakarta)" />
+          </div>
+          <button class="btn btn-primary btn-block" onclick="addNode()">+ Tambah Node ke Cluster</button>
+        </div>
+
+        <div class="panel">
+          <h2>Registry Worker Node</h2>
+          <div id="nodeList"></div>
+        </div>
+      </div>
+
+      <!-- KOLOM KANAN: Queue monitor + user list -->
+      <div>
+        <div class="panel" style="margin-bottom:20px;">
+          <h2>Antrian &amp; Event Cluster</h2>
+          <div id="queuePanel">
+            <p style="color:var(--text-dim); font-family:var(--font-mono); font-size:12px;">Memuat...</p>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>User Bot (terbaru)</h2>
+          <div class="table-scroll">
+            <table class="data-table" id="userTable">
+              <thead>
+                <tr><th>ID</th><th>Username</th><th>Model</th><th>Token</th><th>Status</th></tr>
+              </thead>
+              <tbody id="userTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal sederhana untuk pull/unload model -->
+    <div class="panel" style="margin-top:20px;">
+      <h2>Pull / Unload Model ke Node</h2>
+      <div class="form-grid">
+        <input id="pm_node_id" placeholder="Node ID" />
+        <input id="pm_model" placeholder="Nama model (mis. qwen2.5:32b)" />
+      </div>
+      <div style="display:flex; gap:10px; margin-top:12px;">
+        <button class="btn btn-primary" onclick="pullModel()">⬇ Pull Model</button>
+        <button class="btn btn-warn" onclick="unloadModel()">⏏ Unload dari VRAM</button>
+      </div>
+    </div>
+
+    <footer class="page-footer">
+      <span>Enterprise AI Bot Cluster · Admin Panel v2.0</span>
+      <span id="lastUpdated">—</span>
+    </footer>
+  </main>
+
+  <script src="/static/admin.js"></script>
+</body>
+</html>
